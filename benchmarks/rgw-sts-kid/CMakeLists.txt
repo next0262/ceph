@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.20)
+project(bench_sts_jwks LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 23)
+set(CEPH_SOURCE_DIR "" CACHE PATH "Ceph checkout with the kid selection patch")
+set(CEPH_BUILD_DIR "" CACHE PATH "Existing compatible Ceph Linux build")
+set(CEPH_DEP_SOURCE_DIR "${CEPH_SOURCE_DIR}" CACHE PATH "Checkout with initialized fmt submodule")
+option(CEPH_DEBUG_MUTEX "Match the existing Ceph library's debug mutex ABI" ON)
+if(NOT EXISTS "${CEPH_BUILD_DIR}/lib/libceph-common.so")
+  message(FATAL_ERROR "Set CEPH_BUILD_DIR to an existing compatible Linux Ceph build")
+endif()
+find_package(OpenSSL REQUIRED)
+add_executable(bench_sts_jwks bench.cc "${CEPH_SOURCE_DIR}/src/common/ceph_json.cc")
+target_compile_options(bench_sts_jwks PRIVATE -O2 -g0)
+target_compile_definitions(bench_sts_jwks PRIVATE HAVE_CONFIG_H __CEPH__ _FILE_OFFSET_BITS=64 _GNU_SOURCE BOOST_ALLOW_DEPRECATED_HEADERS)
+if(CEPH_DEBUG_MUTEX)
+  target_compile_definitions(bench_sts_jwks PRIVATE CEPH_DEBUG_MUTEX)
+endif()
+target_include_directories(bench_sts_jwks PRIVATE
+  "${CEPH_SOURCE_DIR}/src" "${CEPH_SOURCE_DIR}/src/rgw"
+  "${CEPH_BUILD_DIR}/include" "${CEPH_BUILD_DIR}/src/include"
+  "${CEPH_BUILD_DIR}/boost/include" "${CEPH_DEP_SOURCE_DIR}/src/fmt/include")
+find_library(FMT_LIBRARY NAMES fmtd fmt PATHS "${CEPH_BUILD_DIR}/lib" REQUIRED NO_DEFAULT_PATH)
+target_link_libraries(bench_sts_jwks PRIVATE "${CEPH_BUILD_DIR}/lib/libceph-common.so"
+  ${FMT_LIBRARY} OpenSSL::Crypto OpenSSL::SSL pthread dl)
+set_target_properties(bench_sts_jwks PROPERTIES BUILD_RPATH "${CEPH_BUILD_DIR}/lib")

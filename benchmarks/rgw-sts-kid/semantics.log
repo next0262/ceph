@@ -1,0 +1,12 @@
+# RS256/RSA-2048; median of 7 batches x 200 validations; 20 warmups.
+# Includes JWT decode, JWKS parse, key selection and real signature verification.
+# Excludes HTTP/DNS/TLS, thumbprint checks and logging.
+path,keys,position,original_attempts,patched_attempts,original_us,patched_us,speedup,select_only_us,one_verify_us
+# Semantic checks: token,original_accept,patched_accept,reject_unknown_accept
+missing,1,1,1
+unknown,1,1,0
+wrong-known,1,0,0
+empty,1,1,0
+missing/ne-1.json,1,1,1
+missing/ne-1-no-jwk-kid.json,1,1,1
+sink=0
