@@ -80,7 +80,9 @@ JWKS Caching
 
 For ``AssumeRoleWithWebIdentity``, RGW caches each provider's JSON Web Key Set
 (JWKS) for ``rgw_sts_jwks_cache_ttl`` seconds (default 300) instead of
-contacting the provider on every request. A token is served from the cache
+contacting the provider on every request. Cache entries are kept
+per account or tenant and provider registration. An entry fetched without
+endpoint verification is not reused by a request that requires it. A token is served from the cache
 only when its ``kid`` is present in the cached JWKS. Any other token (an
 unknown ``kid``, or no ``kid`` at all) makes RGW fetch the key set from the
 provider as it did without the cache, so a newly rotated signing key is
