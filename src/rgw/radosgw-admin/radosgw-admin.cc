@@ -557,6 +557,7 @@ void usage()
   cout << "   --provider-url                URL of the OIDC provider\n";
   cout << "   --client-ids                  comma-separated list of client IDs\n";
   cout << "   --thumbprints                 comma-separated list of thumbprints\n";
+  cout << "   --invalidate-jwks-cache       drop the JWKS cached for this provider on every radosgw\n";
 #ifdef WITH_RADOSGW_RADOS
   cout << "\nMFA options:\n";
 #endif
@@ -3468,6 +3469,7 @@ int main(int argc, const char **argv)
   std::string api_name;
   std::string role_name, path, assume_role_doc, policy_name, perm_policy_doc, path_prefix, max_session_duration;
   std::string provider_url, client_ids_str, thumbprints_str;
+  int invalidate_jwks_cache = false;
   std::string description;
   std::string policy_arn;
   std::string redirect_zone;
@@ -4236,6 +4238,8 @@ int main(int argc, const char **argv)
       client_ids_str = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--thumbprints", (char*)NULL)) {
       thumbprints_str = val;
+    } else if (ceph_argparse_binary_flag(args, i, &invalidate_jwks_cache, NULL, "--invalidate-jwks-cache", (char*)NULL)) {
+      // parsed
     } else if (ceph_argparse_witharg(args, i, &val, "--description", (char*)NULL)) {
       description = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--totp-serial", (char*)NULL)) {
@@ -7298,8 +7302,8 @@ int main(int argc, const char **argv)
         return EINVAL;
       }
 
-      if (client_ids_str.empty() && thumbprints_str.empty()) {
-        cerr << "ERROR: at least one of --client-ids or --thumbprints is required" << std::endl;
+      if (client_ids_str.empty() && thumbprints_str.empty() && !invalidate_jwks_cache) {
+        cerr << "ERROR: at least one of --client-ids, --thumbprints or --invalidate-jwks-cache is required" << std::endl;
         return EINVAL;
       }
 
@@ -7323,6 +7327,11 @@ int main(int argc, const char **argv)
       if (!thumbprints_str.empty()) {
         info.thumbprints.clear();
         get_str_vec(thumbprints_str, ",", info.thumbprints);
+      }
+      if (invalidate_jwks_cache) {
+        // every radosgw reads the provider on its next AssumeRoleWithWebIdentity
+        // and stops reusing JWKS documents fetched under the old generation
+        ++info.jwks_generation;
       }
 
       constexpr bool exclusive = false;
