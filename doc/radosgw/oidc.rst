@@ -60,15 +60,17 @@ single entry, include the existing values along with the new one.
    radosgw-admin oidc-provider modify --provider-url https://accounts.google.com \
      --client-ids newapp1,newapp2
 
-``--invalidate-jwks-cache`` makes every radosgw stop using the JSON Web Key
-Set it has cached for this provider (see `JWKS Caching`_). It can be combined
-with the options above or given on its own. Use ``--account-id`` for an
-account-scoped provider.
+Invalidate Cached JWKS
+----------------------
+
+Invalidate the provider's cached keys without changing its thumbprints or
+client IDs (see `JWKS Caching`_). Use ``--account-id`` for an account-scoped
+provider; omit it for a global provider.
 
 .. prompt:: bash #
 
-   radosgw-admin oidc-provider modify --provider-url https://accounts.google.com \
-     --invalidate-jwks-cache
+   radosgw-admin oidc-provider invalidate-jwks-cache \
+     --provider-url https://accounts.google.com
 
 Delete a Global OIDC Provider
 -----------------------------
@@ -107,8 +109,8 @@ thumbprint from the RGW provider object
 (``UpdateOpenIDConnectProviderThumbprint``) therefore takes effect on the next
 request using the updated metadata. A key the provider removes from its JWKS
 without such a change stays accepted until the cached copy expires, unless an
-operator invalidates the cache: ``radosgw-admin oidc-provider modify
---invalidate-jwks-cache`` bumps a generation counter on the RGW provider
+operator invalidates the cache: ``radosgw-admin oidc-provider
+invalidate-jwks-cache`` bumps a generation counter on the RGW provider
 object, and every radosgw stops reusing JWKS documents it fetched under the
 previous generation from its next request that reads the updated provider.
 This acts on one provider and leaves caching enabled.

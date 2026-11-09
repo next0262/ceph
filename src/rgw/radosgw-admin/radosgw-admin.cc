@@ -340,6 +340,7 @@ void usage()
   cout << "  role update                      update max_session_duration of a role\n";
   cout << "  oidc-provider create             create an OIDC provider (global if no --account-id)\n";
   cout << "  oidc-provider modify             update thumbprints and/or client-ids of an OIDC provider\n";
+  cout << "  oidc-provider invalidate-jwks-cache  invalidate cached JWKS for an OIDC provider\n";
   cout << "  oidc-provider get                get an OIDC provider\n";
   cout << "  oidc-provider delete             delete an OIDC provider\n";
   cout << "  oidc-provider list               list OIDC providers\n";
@@ -557,7 +558,6 @@ void usage()
   cout << "   --provider-url                URL of the OIDC provider\n";
   cout << "   --client-ids                  comma-separated list of client IDs\n";
   cout << "   --thumbprints                 comma-separated list of thumbprints\n";
-  cout << "   --invalidate-jwks-cache       drop the JWKS cached for this provider on every radosgw\n";
 #ifdef WITH_RADOSGW_RADOS
   cout << "\nMFA options:\n";
 #endif
@@ -849,6 +849,7 @@ static SimpleCmd::Commands all_cmds = {
   { "role update", OPT::ROLE_UPDATE },
   { "oidc-provider create", OPT::OIDC_PROVIDER_CREATE },
   { "oidc-provider modify", OPT::OIDC_PROVIDER_MODIFY },
+  { "oidc-provider invalidate-jwks-cache", OPT::OIDC_PROVIDER_INVALIDATE_JWKS_CACHE },
   { "oidc-provider get", OPT::OIDC_PROVIDER_GET },
   { "oidc-provider delete", OPT::OIDC_PROVIDER_DELETE },
   { "oidc-provider list", OPT::OIDC_PROVIDER_LIST },
@@ -3469,7 +3470,6 @@ int main(int argc, const char **argv)
   std::string api_name;
   std::string role_name, path, assume_role_doc, policy_name, perm_policy_doc, path_prefix, max_session_duration;
   std::string provider_url, client_ids_str, thumbprints_str;
-  int invalidate_jwks_cache = false;
   std::string description;
   std::string policy_arn;
   std::string redirect_zone;
@@ -4238,8 +4238,6 @@ int main(int argc, const char **argv)
       client_ids_str = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--thumbprints", (char*)NULL)) {
       thumbprints_str = val;
-    } else if (ceph_argparse_binary_flag(args, i, &invalidate_jwks_cache, NULL, "--invalidate-jwks-cache", (char*)NULL)) {
-      // parsed
     } else if (ceph_argparse_witharg(args, i, &val, "--description", (char*)NULL)) {
       description = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--totp-serial", (char*)NULL)) {
@@ -4660,6 +4658,7 @@ int main(int argc, const char **argv)
                           && opt_cmd != OPT::ROLE_UPDATE
                           && opt_cmd != OPT::OIDC_PROVIDER_CREATE
                           && opt_cmd != OPT::OIDC_PROVIDER_MODIFY
+                          && opt_cmd != OPT::OIDC_PROVIDER_INVALIDATE_JWKS_CACHE
                           && opt_cmd != OPT::OIDC_PROVIDER_GET
                           && opt_cmd != OPT::OIDC_PROVIDER_DELETE
                           && opt_cmd != OPT::OIDC_PROVIDER_LIST
@@ -6740,6 +6739,7 @@ int main(int argc, const char **argv)
                                         OPT::ROLE_CREATE, OPT::ROLE_DELETE,
                                         OPT::OIDC_PROVIDER_CREATE, OPT::OIDC_PROVIDER_MODIFY,
                                         OPT::OIDC_PROVIDER_DELETE,
+                                        OPT::OIDC_PROVIDER_INVALIDATE_JWKS_CACHE,
                                         OPT::ROLE_POLICY_PUT, OPT::ROLE_POLICY_DELETE,
                                         OPT::ROLE_POLICY_ATTACH, OPT::ROLE_POLICY_DETACH,
                                         OPT::USER_POLICY_ATTACH, OPT::USER_POLICY_DETACH,
@@ -7296,14 +7296,23 @@ int main(int argc, const char **argv)
       return 0;
     }
   case OPT::OIDC_PROVIDER_MODIFY:
+  case OPT::OIDC_PROVIDER_INVALIDATE_JWKS_CACHE:
     {
+      const bool invalidate_jwks_cache =
+          opt_cmd == OPT::OIDC_PROVIDER_INVALIDATE_JWKS_CACHE;
       if (provider_url.empty()) {
         cerr << "ERROR: --provider-url is required" << std::endl;
         return EINVAL;
       }
 
       if (client_ids_str.empty() && thumbprints_str.empty() && !invalidate_jwks_cache) {
-        cerr << "ERROR: at least one of --client-ids, --thumbprints or --invalidate-jwks-cache is required" << std::endl;
+        cerr << "ERROR: at least one of --client-ids or --thumbprints is required" << std::endl;
+        return EINVAL;
+      }
+
+      if (invalidate_jwks_cache &&
+          (!client_ids_str.empty() || !thumbprints_str.empty())) {
+        cerr << "ERROR: --client-ids and --thumbprints require oidc-provider modify" << std::endl;
         return EINVAL;
       }
 
@@ -7329,8 +7338,6 @@ int main(int argc, const char **argv)
         get_str_vec(thumbprints_str, ",", info.thumbprints);
       }
       if (invalidate_jwks_cache) {
-        // every radosgw reads the provider on its next AssumeRoleWithWebIdentity
-        // and stops reusing JWKS documents fetched under the old generation
         ++info.jwks_generation;
       }
 
@@ -7338,7 +7345,7 @@ int main(int argc, const char **argv)
       ret = driver->store_oidc_provider(dpp(), null_yield, info,
                                         exclusive, &objv_tracker);
       if (ret < 0) {
-        cerr << "ERROR: failed to modify OIDC provider: " << cpp_strerror(-ret) << std::endl;
+        cerr << "ERROR: failed to update OIDC provider: " << cpp_strerror(-ret) << std::endl;
         return -ret;
       }
 

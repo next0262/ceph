@@ -20,7 +20,7 @@ struct RGWOIDCProviderInfo
   std::string tenant; // tenant-name or account-id
   std::vector<std::string> client_ids;
   std::vector<std::string> thumbprints;
-  // Incremented by 'radosgw-admin oidc-provider modify --invalidate-jwks-cache'.
+  // Incremented by 'radosgw-admin oidc-provider invalidate-jwks-cache'.
   // A cached JWKS is reused only if it was fetched under the same value.
   uint64_t jwks_generation = 0;
 

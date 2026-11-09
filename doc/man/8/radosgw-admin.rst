@@ -492,8 +492,12 @@ as follows:
 :command:`oidc-provider modify`
   Update thumbprints and/or client-ids of an OIDC provider. The provided list
   fully replaces the existing list for that field; unspecified fields are left
-  unchanged. With ``--invalidate-jwks-cache``, every radosgw also drops the
-  JSON Web Key Set it has cached for this provider.
+  unchanged.
+
+:command:`oidc-provider invalidate-jwks-cache`
+  Invalidate cached JSON Web Key Sets for an OIDC provider. Each radosgw
+  refetches the keys on its next request using the updated provider metadata.
+  Specify ``--provider-url`` and, for an account-scoped provider, ``--account-id``.
 
 :command:`oidc-provider get`
   Get information about an OIDC provider.
@@ -1027,11 +1031,6 @@ OIDC Provider Options
 .. option:: --thumbprints
 
    Comma-separated list of thumbprints.
-
-.. option:: --invalidate-jwks-cache
-
-   With ``oidc-provider modify``, make every radosgw stop using the JSON Web
-   Key Set it has cached for this provider.
 
 
 Bucket Notifications/PubSub Options
