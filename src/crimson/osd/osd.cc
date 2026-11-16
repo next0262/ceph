@@ -662,14 +662,13 @@ seastar::future<> OSD::start()
     return _add_me_to_crush();
   });
   co_await _add_device_class();
-  if (is_rotational.has_value()) {
-    co_await shard_services.invoke_on_all([this](auto &local_service) {
-      local_service.local_state.initialize_scheduler(local_service.get_cct(), *is_rotational);
-    });
-  } else {
+  if (!is_rotational.has_value()) {
     WARN("no device class set, defaulting is_rotational to false");
     is_rotational = false;
   }
+  co_await shard_services.invoke_on_all([this](auto &local_service) {
+    local_service.local_state.initialize_scheduler(local_service.get_cct(), *is_rotational);
+  });
   monc->sub_want("osd_pg_creates", last_pg_create_epoch, 0);
   monc->sub_want("mgrmap", 0, 0);
   monc->sub_want("osdmap", 0, 0);
@@ -681,6 +680,7 @@ seastar::future<> OSD::start()
     DEBUG("replacing unkwnown addrs of cluster messenger");
     cluster_msgr->set_myaddrs(addrs);
   }
+  co_await start_cluster_lanes(osd_required);
   co_await heartbeat->start(pick_addresses(CEPH_PICK_ADDRESS_PUBLIC),
                             pick_addresses(CEPH_PICK_ADDRESS_CLUSTER));
   // create the admin-socket server, and the objects that register
@@ -689,6 +689,18 @@ seastar::future<> OSD::start()
   co_await log_client.set_fsid(monc->get_fsid());
   DEBUG("starting boot");
   co_await start_boot();
+}
+
+seastar::future<> OSD::start_cluster_lanes(uint64_t osd_required)
+{
+  LOG_PREFIX(OSD::start_cluster_lanes);
+  INFO("starting a cluster messenger on each reactor");
+  co_await shard_services.invoke_on_all(
+    [this, osd_required, addrs=cluster_msgr->get_myaddrs()]
+    (auto &local_service) {
+    return local_service.start_cluster_lane(
+      nonce, addrs, osd_required, *this, monc.get(), monc.get());
+  });
 }
 
 seastar::future<> OSD::start_boot()
@@ -875,6 +887,7 @@ seastar::future<> OSD::start_asok_admin()
     asok->register_command(make_asok_hook<SendBeaconHook>(*this));
     asok->register_command(make_asok_hook<RunOSDBenchHook>(*this));
     asok->register_command(make_asok_hook<FlushPgStatsHook>(*this));
+    asok->register_command(make_asok_hook<GetLatestOSDMapHook>(*this));
     asok->register_command(
       make_asok_hook<DumpPGStateHistory>(std::as_const(pg_shard_manager)));
     asok->register_command(make_asok_hook<DumpMetricsHook>());
@@ -927,6 +940,9 @@ seastar::future<> OSD::stop()
     DEBUG("prepared to stop");
     public_msgr->stop();
     cluster_msgr->stop();
+    co_await shard_services.invoke_on_all([](auto &local_service) {
+      local_service.stop_cluster_lane();
+    });
     auto gate_close_fut = gate.close_all();
     co_await asok->stop();
     co_await heartbeat->stop();
@@ -936,6 +952,9 @@ seastar::future<> OSD::stop()
     co_await pg_shard_manager.stop_pgs();
     co_await monc->stop();
     co_await mgrc->stop();
+    co_await shard_services.invoke_on_all([](auto &local_service) {
+      return local_service.shutdown_cluster_lane();
+    });
     co_await shard_services.stop();
     co_await osd_states.stop();
     co_await osd_singleton_state.stop();
@@ -1019,6 +1038,9 @@ OSD::do_ms_dispatch(
     return handle_osd_map(boost::static_pointer_cast<MOSDMap>(m));
   case CEPH_MSG_OSD_OP:
     return handle_osd_op(conn, boost::static_pointer_cast<MOSDOp>(m));
+  case CEPH_MSG_PING:
+    // clients ping connections with laggy ops, only to detect their reset
+    return seastar::now();
   case MSG_OSD_PG_CREATE2:
     return handle_pg_create(
       conn, boost::static_pointer_cast<MOSDPGCreate2>(m));
@@ -1056,6 +1078,8 @@ OSD::do_ms_dispatch(
   case MSG_OSD_BACKFILL_RESERVE:
     [[fallthrough]];
   case MSG_OSD_RECOVERY_RESERVE:
+    [[fallthrough]];
+  case MSG_OSD_POOLMIGRATION_RESERVE:
     [[fallthrough]];
   case MSG_OSD_PG_LOG:
     return handle_peering_op(conn, boost::static_pointer_cast<MOSDPeeringOp>(m));
@@ -1243,6 +1267,18 @@ seastar::future<uint64_t> OSD::send_pg_stats()
   co_return osd_stat.seq;
 }
 
+seastar::future<epoch_t> OSD::wait_for_latest_osdmap()
+{
+  LOG_PREFIX(OSD::wait_for_latest_osdmap);
+  ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
+  const auto [newest, oldest] = co_await monc->get_version("osdmap");
+  DEBUG("newest osdmap: {}, mine: {}", newest, osdmap->get_epoch());
+  // the OSD-level gate is updated only after all PGs have advanced
+  co_return co_await
+    get_shard_services().local_state.osdmap_gate.wait_for_map_untracked(
+      newest, &get_shard_services());
+}
+
 seastar::future<> OSD::handle_osd_map(Ref<MOSDMap> m)
 {
   /* Ensure that only one MOSDMap is processed at a time.  Allowing concurrent
@@ -1366,8 +1402,12 @@ seastar::future<> OSD::committed_osd_maps(
       // osd_id came from old_map->get_all_osds(); if it was purged in the new
       // osdmap, osdmap->get_cluster_addrs(osd_id) would ceph_assert(exists()).
       // old_map is guaranteed to contain osd_id and holds its last-known addr.
-      co_await cluster_msgr->mark_down(
-        old_map->get_cluster_addrs(osd_id).front());
+      const auto addr = old_map->get_cluster_addrs(osd_id).front();
+      // its lanes connected to us from their own ports
+      co_await cluster_msgr->mark_down_all_ports(addr);
+      co_await shard_services.invoke_on_all([addr](auto &local_service) {
+        return local_service.mark_down_cluster_lane(addr);
+      });
     });
 
     co_await pg_shard_manager.update_map(std::move(o));

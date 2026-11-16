@@ -1272,6 +1272,7 @@ class TestIngressService:
             '        name = "client.nfs.foo.test.0.0-rgw";\n'
             '}\n'
             '\n'
+            '\n'
             "%url    rados://.nfs/foo/conf-nfs.foo"
         )
         nfs_expected_conf = {
@@ -1386,6 +1387,7 @@ class TestIngressService:
         nfs_expected_conf['files']['ganesha.conf'] = without_haproxy_hosts(
             nfs_ganesha_txt
         )
+        nfs_expected_conf['config'] = '[client]\n\tobjecter_dispatch_to_session_strand = true\n'
         assert nfs_generated_conf == nfs_expected_conf
 
     @patch("cephadm.services.nfs.NFSService.fence_old_ranks", MagicMock())

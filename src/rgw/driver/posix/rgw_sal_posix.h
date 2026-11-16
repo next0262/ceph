@@ -704,7 +704,7 @@ public:
   virtual int register_to_service_map(const DoutPrefixProvider *dpp, const std::string& daemon_type,
 				      const std::map<std::string, std::string>& meta) override { return 0; }
   virtual void get_quota(RGWQuota& quota) override { return ; }
-  virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit) override { return; }
+  virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& account_ratelimit, RGWRateLimitInfo& anon_ratelimit) override { return; }
   virtual int set_buckets_enabled(const DoutPrefixProvider* dpp, std::vector<rgw_bucket>& buckets, bool enabled, optional_yield y) override { return 0; } // TODO: implement
   virtual int get_sync_policy_handler(const DoutPrefixProvider* dpp,
 				      std::optional<rgw_zone_id> zone,
@@ -1079,6 +1079,7 @@ public:
                const ceph::real_time* mod_ptr, const ceph::real_time* unmod_ptr,
                bool high_precision_time,
                const char* if_match, const char* if_nomatch,
+               const char* dest_if_match, const char* dest_if_nomatch,
                AttrsMod attrs_mod, bool copy_if_newer, Attrs& attrs,
                RGWObjCategory category, uint64_t olh_epoch,
                boost::optional<ceph::real_time> delete_at,

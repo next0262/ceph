@@ -623,3 +623,32 @@ add_rgw_cargo_test_binary(
   UNIT_TEST
   DEPENDS   ceph_rgw_sal_test_env)
 endif()
+
+# cuObject tests need no NVIDIA SDK, RDMA hardware or cluster.
+add_executable(unittest_rgw_cuobj
+  test_rgw_cuobj.cc
+  $<TARGET_OBJECTS:unit-main>)
+add_ceph_unittest(unittest_rgw_cuobj --no-config-file)
+target_link_libraries(unittest_rgw_cuobj rgw_common ${rgw_libs} global)
+# Inject loader failures without making the production library name configurable.
+target_link_options(unittest_rgw_cuobj PRIVATE "LINKER:--wrap=dlopen")
+
+if(WITH_RADOSGW_RADOS)
+  # S3 operations use link-time fake transports and in-memory storage writers.
+  foreach(test_name IN ITEMS get put log)
+    add_executable(unittest_rgw_cuobj_${test_name}
+      test_rgw_cuobj_${test_name}.cc
+      $<TARGET_OBJECTS:unit-main>)
+    add_ceph_unittest(unittest_rgw_cuobj_${test_name} --no-config-file)
+    target_link_libraries(unittest_rgw_cuobj_${test_name}
+      rgw_common ${rgw_libs} global)
+  endforeach()
+endif()
+
+# unittest_rgw_sts_jwks
+add_executable(unittest_rgw_sts_jwks test_rgw_sts_jwks.cc)
+add_ceph_unittest(unittest_rgw_sts_jwks)
+target_include_directories(unittest_rgw_sts_jwks
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+target_link_libraries(unittest_rgw_sts_jwks
+  ceph-common ${UNITTEST_LIBS})

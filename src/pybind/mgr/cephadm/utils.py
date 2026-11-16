@@ -37,6 +37,10 @@ class CephadmNoImage(Enum):
 CEPH_TYPES = ['mgr', 'mon', 'crash', 'osd', 'mds', 'rgw',
               'rbd-mirror', 'cephfs-mirror', 'ceph-exporter']
 GATEWAY_TYPES = ['iscsi', 'nfs', 'nvmeof', 'smb']
+# rgw is a gateway too, but it uses the ceph container image and is therefore
+# listed in CEPH_TYPES, which also places it in the upgrade order. Use this
+# when you mean every gateway daemon type regardless of the image it uses.
+ALL_GATEWAY_TYPES = GATEWAY_TYPES + ['rgw']
 MONITORING_STACK_TYPES = ['node-exporter', 'prometheus',
                           'alertmanager', 'grafana', 'loki', 'promtail', 'alloy',
                           'pushgateway']
@@ -73,6 +77,40 @@ ROTATION_CIPHER = 'aes256k'
 # Do not set the service cipher until all core (mon/mgr/osd/mds)
 # daemons have been upgraded
 SERVICE_CIPHER = 'aes256k'
+
+
+def auth_allowed_cipher_names_from_mon_map(mon_map: Any) -> List[str]:
+    """Return auth_allowed_ciphers names from a MonMap dump (mgr get('mon_map')).
+    """
+    if not isinstance(mon_map, dict):
+        return []
+    raw = mon_map.get('auth_allowed_ciphers')
+    if not isinstance(raw, list):
+        return []
+    names: List[str] = []
+    for item in raw:
+        name = item.get('name') if isinstance(item, dict) else None
+        if name:
+            names.append(str(name))
+    return names
+
+
+def allowed_ciphers_are_aes256k_only(cipher_names: List[str]) -> bool:
+    """True when allowed ciphers are already restricted to aes256k (no legacy aes)."""
+    names = {name.strip() for name in cipher_names if name and name.strip()}
+    return names == {ROTATION_CIPHER}
+
+
+def auth_service_cipher_name_from_mon_map(mon_map: Any) -> Optional[str]:
+    """Return the auth_service_cipher name from a MonMap dump (mgr get('mon_map')).
+    """
+    if not isinstance(mon_map, dict):
+        return None
+    raw = mon_map.get('auth_service_cipher')
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get('name')
+    return str(name) if name else None
 
 
 DEFAULT_SSH_CONFIG = """
@@ -306,3 +344,18 @@ def get_default_ssh_config() -> str:
         ssh_config += f'  Ciphers {FIPS_SSH_CIPHERS}\n'
 
     return ssh_config
+
+
+def build_ceph_volume_cmd(
+    log_level: str,
+    command: List[str],
+    prefix: Optional[List[str]] = None,
+) -> List[str]:
+    """Build ceph-volume argv after cephadm's '--' separator.
+
+    prefix is for flags that must appear before '--' (e.g. --config-json).
+    """
+    cmd: List[str] = list(prefix or [])
+    cmd.extend(['--', '--log-level', log_level])
+    cmd.extend(command)
+    return cmd

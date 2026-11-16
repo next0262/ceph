@@ -2385,7 +2385,7 @@ public:
           sc(_sc), sync_env(_sc->env),
           pool(_pool),
           shard_id(_shard_id),
-          sync_marker(_marker), objv(objv) {
+          sync_marker(_marker), sync_status(sync_status), objv(objv) {
     tn = sync_env->sync_tracer->add_node(_tn_parent, "shard", std::to_string(shard_id));
   }
 
@@ -6097,7 +6097,7 @@ int RGWSyncBucketCR::operate(const DoutPrefixProvider *dpp)
 			sc->env->driver->getRados()->get_rados_handle(),
 			error_repo,
 			rgw::error_repo::encode_key(source_bs, current_gen),
-			ceph::real_clock::zero()),
+			ceph::real_clock::zero() + std::chrono::nanoseconds(1)) /*the smallest timestamp that isn't zero.*/,
 		    sc->lcc.adj_concurrency(
 			cct->_conf->rgw_data_sync_spawn_window),
 		    [&](uint64_t stack_id, int ret) {

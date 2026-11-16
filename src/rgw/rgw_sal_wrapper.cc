@@ -16,6 +16,9 @@
  * without the full complexity of the S3 REST API handlers.
  */
 
+#include <array>
+#include <fmt/compile.h>
+
 #include "rgw_sal_wrapper.h"
 #include "rgw/rgw_sal.h"
 #include "rgw/rgw_bucket.h"
@@ -32,6 +35,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -180,6 +184,24 @@ static void c_meta_to_attrs(const DoutPrefixProvider* dpp,
   }
 }
 
+
+namespace {
+
+// "<major>.<minor>" formatted at compile time: fmt's FMT_COMPILE formatting of
+// integral arguments is usable in constant expressions, so the string the Rust
+// side reads is a constant and needs no runtime initialization.
+constexpr auto make_sal_wrapper_version_string() {
+  std::array<char, 32> out{};
+  fmt::format_to(out.data(), FMT_COMPILE("{}.{}"),
+                 RGW_SAL_WRAPPER_VERSION_MAJOR, RGW_SAL_WRAPPER_VERSION_MINOR);
+  return out;
+}
+
+constexpr auto sal_wrapper_version_string = make_sal_wrapper_version_string();
+static_assert(sal_wrapper_version_string.front() != '\0' &&
+              sal_wrapper_version_string.back() == '\0');
+
+} // anonymous namespace
 
 extern "C" {
 
@@ -409,6 +431,47 @@ int rgw_put_object_conditional( CRgwDriver* driver_ptr, const CRgwDoutPrefix* dp
   return ret;
 }
 
+// Read exactly [offset, offset + len) into bl.
+// A single ReadOp::read() call returns at most one RADOS stripe
+// (RGWRados::Object::Read::read clamps the length to the current stripe and
+// to rgw_max_chunk_size), so a range that crosses a stripe or multipart part
+// boundary needs several calls. Callers (the lancedb object store) rely on
+// getting the full range: lance slices the returned buffer by the requested
+// length and panics on a short read.
+static int read_full_range(rgw::sal::Object::ReadOp* read_op, uint64_t offset,
+                           uint64_t len, bufferlist& bl, optional_yield y,
+                           const DoutPrefixProvider* dpp) {
+  // the whole range is held in memory, so it cannot exceed what bufferlist::length() can represent
+  if (len > std::numeric_limits<decltype(bl.length())>::max()) {
+    ldpp_dout(dpp, 1) << "ERROR: sal_wrapper: range of " << len << " bytes at offset "
+                      << offset << " is too big to read into memory" << dendl;
+    return -EFBIG;
+  }
+  const int64_t end_ofs = offset + len - 1;
+  uint64_t cur_ofs = offset;
+  while (cur_ofs <= static_cast<uint64_t>(end_ofs)) {
+    bufferlist chunk;
+    const int ret = read_op->read(cur_ofs, end_ofs, chunk, y, dpp);
+    if (ret < 0) {
+      return ret;
+    }
+    if (chunk.length() == 0) {
+      // the object shrank underneath us (e.g. overwritten with a shorter one)
+      ldpp_dout(dpp, 1) << "ERROR: sal_wrapper: short read at offset " << cur_ofs
+                        << " of range [" << offset << ", " << end_ofs
+                        << "], got " << bl.length() << " of " << len << " bytes" << dendl;
+      return -EIO;
+    }
+    cur_ofs += chunk.length();
+    bl.claim_append(chunk);
+  }
+  if (bl.length() > len) {
+    // should not happen: read() never returns past end_ofs
+    bl.splice(len, bl.length() - len);
+  }
+  return 0;
+}
+
 // Callers issue ranged reads (offset/length) for large objects.
 // Read length is clamped to min(requested, obj_size - offset).
 // TODO: explore streaming reads via callback-based Rust FFI.
@@ -425,7 +488,8 @@ int rgw_get_object( CRgwDriver* driver_ptr, const CRgwDoutPrefix* dpp_ptr,
   }
 
   ldpp_dout(dpp, 10) << "rgw_get_object: bucket=" << bucket_id->name
-                     << " obj=" << obj_id->key << dendl;
+                     << " obj=" << obj_id->key << " offset=" << offset
+                     << " length=" << length << dendl;
 
   buffer->data = nullptr;
   buffer->len = 0;
@@ -484,22 +548,15 @@ int rgw_get_object( CRgwDriver* driver_ptr, const CRgwDoutPrefix* dpp_ptr,
   }
 
   bufferlist bl;
-  int64_t end_ofs = offset + read_len - 1;
-  ret = read_op->read(offset, end_ofs, bl, y, dpp);
+  ret = read_full_range(read_op.get(), offset, read_len, bl, y, dpp);
   if (ret < 0) {
     free(buffer->data);
     buffer->data = nullptr;
     return ret;
   }
 
-  size_t actual_len = bl.length();
-  if (actual_len > read_len) {
-    actual_len = read_len;
-  }
-  if (actual_len > 0) {
-    memcpy(buffer->data, bl.c_str(), actual_len);
-  }
-  buffer->len = actual_len;
+  bl.begin().copy(read_len, reinterpret_cast<char*>(buffer->data));
+  buffer->len = read_len;
 
   return 0;
 }
@@ -591,22 +648,15 @@ int rgw_get_object_conditional( CRgwDriver* driver_ptr, const CRgwDoutPrefix* dp
   }
 
   bufferlist bl;
-  int64_t end_ofs = offset + read_len - 1;
-  ret = read_op->read(offset, end_ofs, bl, y, dpp);
+  ret = read_full_range(read_op.get(), offset, read_len, bl, y, dpp);
   if (ret < 0) {
     free(buffer->data);
     buffer->data = nullptr;
     return ret;
   }
 
-  size_t actual_len = bl.length();
-  if (actual_len > read_len) {
-    actual_len = read_len;
-  }
-  if (actual_len > 0) {
-    memcpy(buffer->data, bl.c_str(), actual_len);
-  }
-  buffer->len = actual_len;
+  bl.begin().copy(read_len, reinterpret_cast<char*>(buffer->data));
+  buffer->len = read_len;
 
   return 0;
 }
@@ -942,6 +992,8 @@ int rgw_copy_object( CRgwDriver* driver_ptr, const CRgwDoutPrefix* dpp_ptr,
                             false,            /* high_precision_time */
                             nullptr,          /* if_match */
                             nullptr,          /* if_nomatch */
+                            nullptr,          /* dest_if_match */
+                            nullptr,          /* dest_if_nomatch */
                             rgw::sal::ATTRSMOD_NONE,
                             false,            /* copy_if_newer */
                             attrs,
@@ -1053,6 +1105,8 @@ int rgw_copy_object_conditional( CRgwDriver* driver_ptr, const CRgwDoutPrefix* d
                             false,            /* high_precision_time */
                             if_match,         /* if_match */
                             copy_if_nomatch,  /* if_nomatch */
+                            nullptr,          /* dest_if_match */
+                            nullptr,          /* dest_if_nomatch */
                             rgw::sal::ATTRSMOD_NONE,
                             false,            /* copy_if_newer */
                             attrs,
@@ -1563,15 +1617,7 @@ uint64_t rgw_get_max_chunk_size(CRgwDriver* driver_ptr) {
 }
 
 const char* rgw_sal_wrapper_version(void) {
-  static char version[16];
-  static bool initialized = false;
-  if (!initialized) {
-    snprintf(version, sizeof(version), "%d.%d",
-             RGW_SAL_WRAPPER_VERSION_MAJOR,
-             RGW_SAL_WRAPPER_VERSION_MINOR);
-    initialized = true;
-  }
-  return version;
+  return sal_wrapper_version_string.data();
 }
 
 } // extern "C"

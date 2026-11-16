@@ -182,6 +182,11 @@ public:
   /// @return the seq id of the pg stats being sent
   seastar::future<uint64_t> send_pg_stats();
 
+  /// fetch the newest osdmap from the mon, and wait until it is
+  /// applied by all PGs
+  /// @return the epoch of that map
+  seastar::future<epoch_t> wait_for_latest_osdmap();
+
   auto &get_shard_services() {
     return shard_services.local();
   }
@@ -195,6 +200,7 @@ private:
     crimson::os::FuturizedStore &store
   );
   seastar::future<> start_boot();
+  seastar::future<> start_cluster_lanes(uint64_t osd_required);
   seastar::future<> _preboot(version_t oldest_osdmap, version_t newest_osdmap);
   seastar::future<> _send_boot();
   seastar::future<> _add_me_to_crush();

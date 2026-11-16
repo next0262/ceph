@@ -16,6 +16,7 @@
 #ifndef CEPH_OBJECTER_H
 #define CEPH_OBJECTER_H
 
+#include <deque>
 #include <list>
 #include <map>
 #include <mutex>
@@ -314,6 +315,20 @@ struct ObjectOperation {
     osd_op.op.alloc_hint.expected_write_size = expected_write_size;
     osd_op.op.alloc_hint.flags = flags;
   }
+  void add_pg_pool_migration_reserve(int op, const hobject_t& start_obj,
+                                     int64_t num_bytes, int64_t num_objects,
+                                     epoch_t epoch) {
+    using ceph::encode;
+    OSDOp& osd_op = add_op(op);
+    encode(start_obj, osd_op.indata);
+    encode(epoch, osd_op.indata);
+    osd_op.op.pool_migration_reserve.num_bytes = num_bytes;
+    osd_op.op.pool_migration_reserve.num_objects = num_objects;
+  }
+  void add_pg_pool_migration_release(int op) {
+    using ceph::encode;
+    add_op(op);
+  }
 
   // ------
 
@@ -334,6 +349,21 @@ struct ObjectOperation {
     else
       add_pgls_filter(CEPH_OSD_OP_PGNLS_FILTER, count, filter, cookie,
 		      start_epoch);
+  }
+
+  void pg_pool_migration_reserve(const hobject_t& start_obj,
+                                 int64_t num_bytes,
+                                 int64_t num_objects,
+                                 epoch_t epoch) {
+    add_pg_pool_migration_reserve(CEPH_OSD_OP_PG_POOL_MIGRATION_RESERVE,
+                                  start_obj, num_bytes, num_objects,
+                                  epoch);
+    flags |= CEPH_OSD_FLAG_PGOP;
+  }
+
+  void pg_pool_migration_release() {
+    add_pg_pool_migration_release(CEPH_OSD_OP_PG_POOL_MIGRATION_RELEASE);
+    flags |= CEPH_OSD_FLAG_PGOP;
   }
 
   void scrub_ls(const librados::object_id_t& start_after,
@@ -1106,6 +1136,7 @@ struct ObjectOperation {
     mempool::osd_pglog::map<uint32_t, int> *out_reqid_return_codes;
     uint64_t *out_truncate_seq;
     uint64_t *out_truncate_size;
+    std::map<std::pair<uint64_t, entity_name_t>, watch_info_t> *out_watchers;
     int *prval;
     C_ObjectOperation_copyget(object_copy_cursor_t *c,
 			      uint64_t *s,
@@ -1122,6 +1153,7 @@ struct ObjectOperation {
 			      mempool::osd_pglog::map<uint32_t, int> *oreqid_return_codes,
 			      uint64_t *otseq,
 			      uint64_t *otsize,
+                              std::map<std::pair<uint64_t, entity_name_t>, watch_info_t> *owatchers,
 			      int *r)
       : cursor(c),
 	out_size(s), out_mtime(m),
@@ -1132,6 +1164,7 @@ struct ObjectOperation {
 	out_reqid_return_codes(oreqid_return_codes),
 	out_truncate_seq(otseq),
 	out_truncate_size(otsize),
+        out_watchers(owatchers),
 	prval(r) {}
     void finish(int r) override {
       using ceph::decode;
@@ -1177,6 +1210,8 @@ struct ObjectOperation {
 	  *out_truncate_seq = copy_reply.truncate_seq;
 	if (out_truncate_size)
 	  *out_truncate_size = copy_reply.truncate_size;
+        if (out_watchers)
+          *out_watchers = copy_reply.watchers;
 	*cursor = copy_reply.cursor;
       } catch (const ceph::buffer::error& e) {
 	if (prval)
@@ -1202,6 +1237,7 @@ struct ObjectOperation {
 		mempool::osd_pglog::map<uint32_t, int> *out_reqid_return_codes,
 		uint64_t *truncate_seq,
 		uint64_t *truncate_size,
+                std::map<std::pair<uint64_t, entity_name_t>, watch_info_t> *out_watchers,
 		int *prval) {
     using ceph::encode;
     OSDOp& osd_op = add_op(CEPH_OSD_OP_COPY_GET);
@@ -1217,7 +1253,8 @@ struct ObjectOperation {
 				    out_flags, out_data_digest,
 				    out_omap_digest, out_reqids,
 				    out_reqid_return_codes, truncate_seq,
-				    truncate_size, prval);
+				    truncate_size, out_watchers,
+                                    prval);
     out_bl[p] = &h->bl;
     set_handler(h);
   }
@@ -1542,7 +1579,8 @@ struct ObjectOperation {
     OSDOp& osd_op = add_op(CEPH_OSD_OP_COPY_FROM);
     osd_op.op.copy_from.snapid = snapid;
     osd_op.op.copy_from.src_version = src_version;
-    osd_op.op.copy_from.flags = flags;
+    osd_op.op.copy_from.flags = flags; // 8-bits
+    osd_op.op.copy_from.flags2 = flags; // 32-bits
     osd_op.op.copy_from.src_fadvise_flags = src_fadvise_flags;
     encode(src, osd_op.indata);
     encode(src_oloc, osd_op.indata);
@@ -1555,7 +1593,8 @@ struct ObjectOperation {
     OSDOp& osd_op = add_op(CEPH_OSD_OP_COPY_FROM2);
     osd_op.op.copy_from.snapid = snapid;
     osd_op.op.copy_from.src_version = src_version;
-    osd_op.op.copy_from.flags = flags;
+    osd_op.op.copy_from.flags = flags; // 8-bits
+    osd_op.op.copy_from.flags2 = flags; // 32-bits
     osd_op.op.copy_from.src_fadvise_flags = src_fadvise_flags;
     encode(src, osd_op.indata);
     encode(src_oloc, osd_op.indata);
@@ -1744,6 +1783,9 @@ private:
   std::atomic<int> global_op_flags{0}; // flags which are applied to each IO op
   bool keep_balanced_budget = false;
   bool honor_pool_full = true;
+  // True only on client objecters to route ops to the source pool. Remains false
+  // in the OSD objecter so ops can be sent directly to the target pool.
+  bool honor_pool_migration = false;
 
   std::atomic<int> extra_read_flags{0};
 
@@ -1814,7 +1856,11 @@ private:
       it++;
     }
   }
-
+  // Cache of pool migration watermarks for each placement group. Cleared on
+  // each epoch and updated by the OSD providing the current watermark when
+  // redirecting a request to the target pool. Use rwlock for thread safety
+  // when accessing.
+  std::map<pg_t, hobject_t> pool_migration_watermarks;
 public:
   void maybe_request_map();
 
@@ -1844,9 +1890,14 @@ private:
   void update_crush_location();
 
   class RequestStateHook;
+  class SessionStrandHook;
 
   RequestStateHook *m_request_state_hook = nullptr;
   std::string m_admin_socket_name;
+  SessionStrandHook *m_session_strand_hook = nullptr;
+
+public:
+  void dump_session_strands(ceph::Formatter *f);
 
 public:
   /*** track pending operations ***/
@@ -1887,6 +1938,7 @@ public:
     bool sort_bitwise = false; ///< whether the hobject_t sort order is bitwise
     bool recovery_deletes = false; ///< whether the deletes are performed during recovery instead of peering
     bool allows_ecoptimizations = false; ///< whether EC plugin optimizations are enabled.
+    std::set<pg_t> migrating_pgs; ///< PGs migrating for pool migration
     uint32_t peering_crush_bucket_count = 0;
     uint32_t peering_crush_bucket_target = 0;
     uint32_t peering_crush_bucket_barrier = 0;
@@ -1918,6 +1970,15 @@ public:
 		       target_oloc.key,
 		       CEPH_NOSNAP,
 		       target_oloc.hash >= 0 ? target_oloc.hash : pgid.ps(),
+		       target_oloc.pool,
+		       target_oloc.nspace);
+    }
+
+    hobject_t get_hobj(pg_t pg_id) {
+      return hobject_t(target_oid,
+		       target_oloc.key,
+		       CEPH_NOSNAP,
+		       target_oloc.hash >= 0 ? target_oloc.hash : pg_id.ps(),
 		       target_oloc.pool,
 		       target_oloc.nspace);
     }
@@ -2256,6 +2317,24 @@ public:
     std::string nspace;
 
     ceph::buffer::list bl;   // raw data read to here
+
+    // Pool Migration specific attributes
+  	std::list<librados::ListObjectImpl> tgt_list;
+  	std::list<librados::ListObjectImpl> src_list;
+  	std::list<librados::ListObjectImpl> intermediate_list;
+
+  	collection_list_handle_t end_of_tgt;
+
+	uint64_t src_pool_id = -1;
+	uint64_t tgt_pool_id = -1;
+
+  	collection_list_handle_t src_pos;
+
+  	enum stage {TGT_READ, SRC_READ, TGT_SECOND_READ};
+  	stage current_stage = TGT_READ;
+  	bool end_of_triple_read = false;
+  	// End of Pool Migration attributes
+
     std::list<librados::ListObjectImpl> list;
 
     ceph::buffer::list filter;
@@ -2389,7 +2468,7 @@ public:
 			boost::system::error_code ec);
   void _finish_command(CommandOp *c, boost::system::error_code ec,
 		       std::string&& rs, ceph::buffer::list&& bl);
-  void handle_command_reply(MCommandReply *m);
+  void handle_command_reply(cref_t<MCommandReply> m);
 
   // -- lingering ops --
 
@@ -2527,14 +2606,33 @@ public:
     // lockdep (using std::sharedMutex) because lockdep doesn't know
     // that.
     std::shared_mutex lock;
+    boost::asio::strand<boost::asio::io_context::executor_type> strand;
+
+    std::mutex strand_track_lock;
+    std::deque<MessageRef> queued_messages;
+
+    template <typename Callable>
+    void track_enqueue(const MessageRef& m, Callable&& f) {
+      std::lock_guard l(strand_track_lock);
+      queued_messages.push_back(m);
+      boost::asio::post(strand, std::forward<Callable>(f));
+    }
+
+    void track_dequeue(const MessageRef& m) {
+      std::lock_guard l(strand_track_lock);
+      ceph_assert(!queued_messages.empty());
+      auto const& _m = queued_messages.front();
+      ceph_assert(_m == m);
+      queued_messages.pop_front();
+    }
 
     int incarnation;
     ConnectionRef con;
     int num_locks;
     std::unique_ptr<std::mutex[]> completion_locks;
 
-    OSDSession(CephContext *cct, int o) :
-      osd(o), incarnation(0), con(NULL),
+    OSDSession(CephContext *cct, int o, boost::asio::io_context::executor_type ex) :
+      osd(o), strand(ex), incarnation(0), con(NULL),
       num_locks(cct->_conf->objecter_completion_locks_per_session),
       completion_locks(new std::mutex[num_locks]) {}
 
@@ -2545,6 +2643,11 @@ public:
     std::unique_lock<std::mutex> get_lock(object_t& oid);
   };
   std::map<int,OSDSession*> osd_sessions;
+
+  // Runs in _op_submit() with the rwlock dropped when
+  // objecter_debug_inject_relock_delay is set.  A test can replace it to land
+  // a map there.
+  fu2::unique_function<void()> relock_delay = [] { sleep(1); };
 
   bool osdmap_full_flag() const;
   bool osdmap_pool_full(const int64_t pool_id) const;
@@ -2573,9 +2676,8 @@ public:
   std::map<ceph_tid_t,PoolOp*> pool_ops;
   std::atomic<unsigned> num_homeless_ops{0};
 
-  OSDSession* homeless_session = new OSDSession(cct, -1);
-  OSDSession* splitop_session = new OSDSession(cct, -2); // -2 to differentiate from homeless
-
+  OSDSession* homeless_session;
+  OSDSession* splitop_session;
 
   // ops waiting for an osdmap with a new pool or confirmation that
   // the pool does not exist (may be expanded to other uses later)
@@ -2610,7 +2712,7 @@ public:
   // previous tid), the in-flight count if one was taken on an earlier pass,
   // and the Objecter's reference.  The completion must already have been run.
   void _finish_unsent_op(Op *op);
-  boost::system::error_code process_op_reply_handlers(Op *op, std::vector<OSDOp> &out_ops);
+  boost::system::error_code process_op_reply_handlers(Op *op, const std::vector<OSDOp>& out_ops);
   void complete_op_reply(Op *op, boost::system::error_code handler_error, OSDSession *s, std::unique_lock<std::shared_mutex> &sl, int rc);
   static bool is_pg_changed(
     int oldprimary,
@@ -2633,12 +2735,13 @@ public:
     Op *op);
 
   bool target_should_be_paused(op_target_t *op);
-  int _calc_target(op_target_t *t, bool any_change = false);
-  int _map_session(op_target_t *op, OSDSession **s,
+  int _calc_target(op_target_t *t, snapid_t snap, bool any_change = false);
+  int _map_session(op_target_t *op, snapid_t snap, OSDSession **s,
 		   ceph::shunique_lock<ceph::shared_mutex>& lc);
 
   void _session_op_assign(OSDSession *s, Op *op);
   void _session_op_remove(OSDSession *s, Op *op);
+  void _session_op_remove(OSDSession *s, std::map<ceph_tid_t,Op*>::iterator& it);
   void _session_linger_op_assign(OSDSession *to, LingerOp *op);
   void _session_linger_op_remove(OSDSession *from, LingerOp *op);
   void _session_command_op_assign(OSDSession *to, CommandOp *op);
@@ -2703,6 +2806,10 @@ private:
 
   void _nlist_reply(NListContext *list_context, int r, Context *final_finish,
 		   epoch_t reply_epoch);
+
+  void combine_result_lists(NListContext *list_context);
+
+  static uint32_t reverse_bits_32(uint32_t n);
 
   void resend_mon_ops();
 
@@ -2785,6 +2892,9 @@ private:
   void set_honor_pool_full() { honor_pool_full = true; }
   void unset_honor_pool_full() { honor_pool_full = false; }
 
+  void set_honor_pool_migration() { honor_pool_migration = true; }
+  void unset_honor_pool_migration() { honor_pool_migration = false; }
+
   void _scan_requests(
     OSDSession *s,
     bool skipped_map,
@@ -2816,13 +2926,11 @@ private:
       return false;
     }
   }
-  void ms_fast_dispatch2(const MessageRef& m) override {
-    [[maybe_unused]] auto s = ms_dispatch2(m);
-  }
+  void ms_fast_dispatch2(const MessageRef& m) override;
 
-  void handle_osd_op_reply(class MOSDOpReply *m);
-  void handle_osd_backoff(class MOSDBackoff *m);
-  void handle_watch_notify(class MWatchNotify *m);
+  void handle_osd_op_reply(cref_t<MOSDOpReply> m);
+  void handle_osd_backoff(cref_t<MOSDBackoff> m);
+  void handle_watch_notify(cref_t<MWatchNotify> m);
   void handle_osd_map(class MOSDMap *m);
   void wait_for_osd_map(epoch_t e=0);
 
@@ -3369,7 +3477,7 @@ public:
  public:
 
   void _do_watch_notify(boost::intrusive_ptr<LingerOp> info,
-                        boost::intrusive_ptr<MWatchNotify> m);
+                        cref_t<MWatchNotify> m);
 
   /**
    * set up initial ops in the op std::vector, and allocate a final op slot.
@@ -4139,6 +4247,8 @@ private:
   epoch_t epoch_barrier = 0;
   bool retry_writes_after_first_reply =
     cct->_conf->objecter_retry_writes_after_first_reply;
+
+  bool dispatch_to_session_strand = false;
 
 public:
   void set_epoch_barrier(epoch_t epoch);

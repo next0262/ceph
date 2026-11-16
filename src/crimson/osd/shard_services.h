@@ -28,12 +28,9 @@
 #include "crimson/osd/state.h"
 #include "common/AsyncReserver.h"
 #include "crimson/net/Connection.h"
+#include "crimson/net/Messenger.h"
 #include "mgr/OSDPerfMetricTypes.h"
 #include "osd/ECExtentCache.h"
-
-namespace crimson::net {
-  class Messenger;
-}
 
 namespace crimson::mgr {
   class Client;
@@ -335,6 +332,9 @@ private:
 			  bool forced = false);
   void remove_want_pg_temp(pg_t pgid);
   void requeue_pg_temp();
+
+  seastar::future<> send_pg_migrated_pool(int64_t migration_target, pg_t pgid);
+
   seastar::future<> send_pg_temp();
 
   std::set<pg_t> pg_created;
@@ -417,6 +417,10 @@ class ShardServices : public OSDMapService,
     static_cast<size_t>(OperationTypeCode::last_op)> pg_op_shard_remote{};
   seastar::metrics::metric_groups metrics;
   void register_metrics();
+
+  // This reactor's own cluster messenger. send_to_osd() sends on it
+  // instead of on reactor 0's.
+  crimson::net::MessengerRef cluster_lane_msgr;
 
   template <typename F, typename... Args>
   auto with_singleton(F &&f, Args&&... args) {
@@ -536,7 +540,18 @@ public:
     register_metrics();
   }
 
-  FORWARD_TO_OSD_SINGLETON(send_to_osd)
+  seastar::future<> send_to_osd(int peer, MessageURef m, epoch_t from_epoch);
+
+  seastar::future<> start_cluster_lane(
+    uint32_t nonce,
+    entity_addrvec_t addrs,
+    uint64_t osd_required,
+    crimson::net::Dispatcher &dispatcher,
+    crimson::auth::AuthClient *auth_client,
+    crimson::auth::AuthServer *auth_server);
+  void stop_cluster_lane();
+  seastar::future<> shutdown_cluster_lane();
+  seastar::future<> mark_down_cluster_lane(entity_addr_t addr);
 
   crimson::os::BackendStore get_store(store_index_t store_index) {
     auto store = local_state.b_store;
@@ -734,6 +749,7 @@ public:
   QUEUE_FOR_OSD_SINGLETON(send_pg_created)
   QUEUE_FOR_OSD_SINGLETON(send_alive)
   QUEUE_FOR_OSD_SINGLETON(send_pg_temp)
+  QUEUE_FOR_OSD_SINGLETON(send_pg_migrated_pool)
   FORWARD_TO_OSD_SINGLETON(get_osd_stat)
   FORWARD_TO_OSD_SINGLETON(update_osd_stat)
   FORWARD_TO_OSD_SINGLETON(inc_osd_stat_repaired)

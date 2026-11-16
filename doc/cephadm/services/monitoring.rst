@@ -189,7 +189,7 @@ example spec file:
     placement:
       count: 1
     networks:
-    - 192.169.142.0/24
+    - 192.168.142.0/24
     spec:
       port: 4200
       protocol: http
@@ -241,6 +241,7 @@ configuration. The following configuration options are available:
 - ``container_image_promtail``
 - ``container_image_haproxy``
 - ``container_image_keepalived``
+- ``container_image_pushgateway``
 - ``container_image_snmp_gateway``
 - ``container_image_elasticsearch``
 - ``container_image_jaeger_agent``
@@ -362,6 +363,7 @@ overridden. These are the names to be used when storing with ``ceph config-key s
 - ``services/oauth2-proxy/oauth2-proxy.conf``
 - ``services/prometheus/prometheus.yml``
 - ``services/prometheus/web.yml``
+- ``services/pushgateway/web.yml``
 - ``services/loki.yml``
 - ``services/promtail.yml``
 
@@ -384,6 +386,7 @@ You can look up the file templates that are currently used by cephadm in
 - ``services/oauth2-proxy/oauth2-proxy.conf.j2``
 - ``services/prometheus/prometheus.yml.j2``
 - ``services/prometheus/web.yml.j2``
+- ``services/pushgateway/web.yml.j2``
 - ``services/loki.yml.j2``
 - ``services/promtail.yml.j2``
 
@@ -671,6 +674,32 @@ admin password set would make the dashboard inaccessible, cephadm requires
 setting the ``initial_admin_password`` when ``anonymous_access`` is set to false.
 
 
+Setting up Pushgateway
+----------------------
+
+Prometheus `Pushgateway <https://prometheus.io/docs/instrumenting/pushing/>`_
+acts as a metric cache for batch jobs. Short-lived or periodic jobs push their
+metrics to the Pushgateway, and Prometheus scrapes them from there. Pushgateway
+is **not** auto-deployed during bootstrap. To deploy it:
+
+.. prompt:: bash #
+
+  ceph orch apply pushgateway
+
+The default port is ``9091``.  Pushed metrics persist across container restarts.
+Prometheus automatically discovers pushgateway via the HTTP service discovery
+endpoint, so no manual Prometheus configuration is needed.
+
+Pushgateway uses TLS when ``secure_monitoring_stack`` is enabled or a
+``mgmt-gateway`` service is deployed. Mutual TLS (client-certificate
+authentication) is required only when ``mgmt-gateway`` is deployed.
+
+To remove the service:
+
+.. prompt:: bash #
+
+  ceph orch rm pushgateway
+
 Setting up Alertmanager
 -----------------------
 
@@ -701,6 +730,56 @@ Run ``reconfig`` on the service to update its configuration:
 
 .. prompt:: bash #
 
+  ceph orch reconfig alertmanager
+
+Sending Alerts to Slack
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The Alertmanager spec adds only webhook receivers. To send alerts to Slack, or
+to another receiver type such as email or PagerDuty, override the Alertmanager
+template as described in :ref:`cephadm-overwrite-jinja2-templates`.
+
+Start from the default template,
+``src/pybind/mgr/cephadm/templates/services/alertmanager/alertmanager.yml.j2``,
+and keep all of it, including its Jinja2 blocks, so that the Ceph Dashboard and
+any ``webhook_urls`` still receive alerts. Add a route at the top of the
+``routes`` list. ``continue: true`` passes each alert on to the routes after
+it:
+
+.. code-block:: yaml
+
+    route:
+      receiver: 'default'
+      routes:
+        - group_by: ['alertname']
+          receiver: 'slack'
+          continue: true
+        - group_by: ['alertname']
+          group_wait: 10s
+          ...
+
+Then add a receiver to the ``receivers`` list, using the URL of a Slack
+incoming webhook:
+
+.. code-block:: yaml
+
+    - name: 'slack'
+      slack_configs:
+      - api_url: 'https://hooks.slack.com/services/<webhook-path>'
+        send_resolved: true
+
+Cephadm renders the template with Jinja2 before Alertmanager reads it. To use
+Alertmanager template expressions such as ``{{ .CommonAnnotations.summary }}``
+in fields like ``text``, wrap them in ``{% raw %}`` and ``{% endraw %}``. See
+the `Alertmanager configuration documentation
+<https://prometheus.io/docs/alerting/latest/configuration/#slack_config>`_ for
+the other ``slack_configs`` fields.
+
+Store the template and reconfigure Alertmanager:
+
+.. prompt:: bash #
+
+  ceph config-key set mgr/cephadm/services/alertmanager/alertmanager.yml -i $PWD/alertmanager.yml.j2
   ceph orch reconfig alertmanager
 
 Turn on Certificate Validation

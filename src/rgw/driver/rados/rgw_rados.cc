@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include <boost/algorithm/string.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <string_view>
 
 #include <boost/container/flat_set.hpp>
@@ -2939,7 +2940,7 @@ int RGWRados::move_rados_obj(const DoutPrefixProvider *dpp,
   int ret = 0;
   real_time mtime;
   struct timespec mtime_ts;
-  uint64_t size;
+  uint64_t size = 0; // set by stat2() on the first loop iteration
 
   if (src_oid == dst_oid && src_locator == dst_locator) {
     return 0;
@@ -3276,6 +3277,8 @@ int RGWRados::swift_versioning_copy(RGWObjectCtx& obj_ctx,
                false, /* bool high_precision_time */
                NULL, /* const char *if_match */
                NULL, /* const char *if_nomatch */
+               NULL, /* const char *dest_if_match */
+               NULL, /* const char *dest_if_nomatch */
                RGWRados::ATTRSMOD_NONE,
                true, /* bool copy_if_newer */
                state->attrset,
@@ -3377,6 +3380,8 @@ int RGWRados::swift_versioning_restore(RGWObjectCtx& obj_ctx,
                        false,         /* bool high_precision_time */
                        nullptr,       /* const char *if_match */
                        nullptr,       /* const char *if_nomatch */
+                       nullptr,       /* const char *dest_if_match */
+                       nullptr,       /* const char *dest_if_nomatch */
                        RGWRados::ATTRSMOD_NONE,
                        true,          /* bool copy_if_newer */
                        no_attrs,
@@ -3798,7 +3803,7 @@ int RGWRados::Object::Write::write_meta(uint64_t size, uint64_t accounted_size,
   index_op.set_zones_trace(meta.zones_trace);
   
   bool assume_noent = (meta.if_match == NULL && meta.if_nomatch == NULL);
-  int r;
+  int r = 0;
   if (assume_noent) {
     r = _do_write_meta(size, accounted_size, attrs, assume_noent, (void *)&index_op, rctx, trace, log_op);
     if (r == -EEXIST) {
@@ -4150,7 +4155,7 @@ int RGWRados::rewrite_obj(RGWBucketInfo& dest_bucket_info, const rgw_obj& obj, c
   return copy_obj_data(octx, owner, dest_bucket_info,
                        dest_bucket_info.placement_rule,
                        read_op, obj_size - 1, obj, NULL, mtime,
-                       attrset, 0, real_time(), NULL, NULL, dpp, y);
+                       attrset, 0, real_time(), NULL, NULL, NULL, NULL, dpp, y);
 }
 
 
@@ -4709,6 +4714,8 @@ int RGWRados::fetch_remote_obj(RGWObjectCtx& dest_obj_ctx,
                bool high_precision_time,
                const char *if_match,
                const char *if_nomatch,
+               const char *dest_if_match,
+               const char *dest_if_nomatch,
                AttrsMod attrs_mod,
                bool copy_if_newer,
                rgw::sal::Attrs& attrs,
@@ -5076,7 +5083,7 @@ int RGWRados::fetch_remote_obj(RGWObjectCtx& dest_obj_ctx,
   for (i = 0; i < MAX_COMPLETE_RETRY; i++) {
     bool canceled = false;
     ret = processor.complete(accounted_size, etag, mtime, set_mtime,
-                             attrs, rgw::cksum::no_cksum, delete_at, nullptr, nullptr,
+                             attrs, rgw::cksum::no_cksum, delete_at, dest_if_match, dest_if_nomatch,
 			     nullptr, zones_trace, &canceled, rctx,
 			     rgw::sal::FLAG_LOG_OP);
     if (ret < 0) {
@@ -5219,6 +5226,8 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
                bool high_precision_time,
                const char *if_match,
                const char *if_nomatch,
+               const char *dest_if_match,
+               const char *dest_if_nomatch,
                AttrsMod attrs_mod,
                bool copy_if_newer,
                rgw::sal::Attrs& attrs,
@@ -5259,6 +5268,12 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
     return -EINVAL;
   }
 
+  // XXX: destination conditionals are not forwarded to a remote zonegroup yet
+  if (remote_dest && (dest_if_match || dest_if_nomatch)) {
+    ldpp_dout(dpp, 10) << "destination If-Match/If-None-Match not supported when the dest bucket is remote" << dendl;
+    return -ERR_NOT_IMPLEMENTED;
+  }
+
   ldpp_dout(dpp, 5) << "Copy object " << src_obj.bucket << ":" << src_obj.get_oid() << " => " << dest_obj.bucket << ":" << dest_obj.get_oid() << dendl;
 
   if (remote_src || !source_zone.empty()) {
@@ -5274,7 +5289,8 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
                    dest_obj, src_obj, dest_bucket_info, &src_bucket_info,
                    dest_placement, src_mtime, mtime, mod_ptr,
                    unmod_ptr, high_precision_time,
-                   if_match, if_nomatch, attrs_mod, copy_if_newer, attrs, category,
+                   if_match, if_nomatch, dest_if_match, dest_if_nomatch,
+                   attrs_mod, copy_if_newer, attrs, category,
                    olh_epoch, delete_at, ptag, petag, progress_cb, progress_data, rctx,
                    nullptr /* filter */, stat_follow_olh, stat_dest_obj, std::nullopt);
 
@@ -5462,7 +5478,8 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
     attrs.erase(RGW_ATTR_CRYPT_PART_NUMS);
     attrs.erase(RGW_ATTR_CRYPT_PREFETCH_ALIGN);
     return copy_obj_data(dest_obj_ctx, owner, dest_bucket_info, dest_placement, read_op, obj_size - 1, dest_obj,
-                         mtime, real_time(), attrs, olh_epoch, delete_at, petag, dp_factory, dpp, y,
+                         mtime, real_time(), attrs, olh_epoch, delete_at, petag,
+                         dest_if_match, dest_if_nomatch, dp_factory, dpp, y,
                          astate->accounted_size);
   }
 
@@ -5568,6 +5585,8 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
   write_op.meta.category = category;
   write_op.meta.olh_epoch = olh_epoch;
   write_op.meta.delete_at = delete_at;
+  write_op.meta.if_match = dest_if_match;
+  write_op.meta.if_nomatch = dest_if_nomatch;
   write_op.meta.modify_tail = !copy_itself;
   write_op.meta.keep_tail = copy_itself;
 
@@ -5634,11 +5653,14 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
                uint64_t olh_epoch,
 	       real_time delete_at,
                string *petag,
+               const char *dest_if_match,
+               const char *dest_if_nomatch,
                rgw::sal::DataProcessorFactory *dp_factory,
                const DoutPrefixProvider *dpp,
                optional_yield y,
                uint64_t src_accounted_size,
-               bool log_op)
+               bool log_op,
+               bool *pcanceled)
 {
   string tag;
   append_rand_alpha(cct, tag, tag, 32);
@@ -5719,10 +5741,27 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
     accounted_size = dp_factory->get_accounted_size(accounted_size);
   }
 
+  // for testing: hold the copy after reading the source and before writing
+  // the head, to reproduce a race with a concurrent overwrite
+  if (cct->_conf->rgw_inject_delay_sec > 0 &&
+      std::string_view(cct->_conf->rgw_inject_delay_pattern) == "delay_copy_obj_data_complete") {
+    ldpp_dout(dpp, 0) << __func__ << ": injecting delay of " << cct->_conf->rgw_inject_delay_sec
+                      << "s for " << dest_obj << dendl;
+    const auto delay = ceph::make_timespan(cct->_conf->rgw_inject_delay_sec);
+    if (y) {
+      auto yield = y.get_yield_context();
+      boost::asio::steady_timer timer{yield.get_executor(), delay};
+      boost::system::error_code ec;
+      timer.async_wait(yield[ec]);
+    } else {
+      std::this_thread::sleep_for(delay);
+    }
+  }
+
   const req_context rctx{dpp, y, nullptr};
   return aoproc.complete(accounted_size, etag, mtime, set_mtime, attrs,
 			    rgw::cksum::no_cksum, delete_at,
-                            nullptr, nullptr, nullptr, nullptr, nullptr, rctx,
+                            dest_if_match, dest_if_nomatch, nullptr, nullptr, pcanceled, rctx,
                             log_op ? rgw::sal::FLAG_LOG_OP : 0);
 }
 
@@ -5972,6 +6011,7 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
         << dendl;
   }
 
+  bool canceled = false;
   ret = copy_obj_data(obj_ctx,
                       owner,
                       bucket_info,
@@ -5985,13 +6025,20 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
                       olh_epoch,
                       real_time(),
                       nullptr /* petag */,
+                      nullptr /* dest_if_match */,
+                      nullptr /* dest_if_nomatch */,
                       dp_factory,
                       dpp,
                       y,
                       0, /* src_accounted_size: unknown here, keep ofs-based size */
-                      log_op);
+                      log_op,
+                      &canceled);
   if (ret < 0) {
     return ret;
+  }
+  if (canceled) {
+    // the object was overwritten or removed while it was transitioning
+    return -ECANCELED;
   }
 
   return 0;
@@ -6859,10 +6906,6 @@ static int resync_encrypted_multipart(const DoutPrefixProvider* dpp,
   // only overwrite if the tag hasn't changed
   obj_ctx.set_atomic(state.obj, true);
 
-  // make a tiny adjustment to the existing mtime so that fetch_remote_obj()
-  // won't return ERR_NOT_MODIFIED when resyncing the object
-  const auto set_mtime = state.mtime + std::chrono::nanoseconds(1);
-
   // use set_attrs() to update the mtime in a bucket index transaction so the
   // change is recorded in bilog and datalog entries. this will cause any peer
   // zones to resync the object
@@ -6871,7 +6914,7 @@ static int resync_encrypted_multipart(const DoutPrefixProvider* dpp,
   };
 
   return store->set_attrs(dpp, &obj_ctx, bucket_info, state.obj,
-                          add_attrs, nullptr, y, true, set_mtime);
+                          add_attrs, nullptr, y, true);
 }
 
 static void try_resync_encrypted_multipart(const DoutPrefixProvider* dpp,
@@ -7456,7 +7499,8 @@ int RGWRados::get_olh_target_state(const DoutPrefixProvider *dpp, RGWObjectCtx&
 int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *octx,
                                  RGWBucketInfo& bucket_info, const rgw_obj& obj,
                                  RGWObjStateManifest** psm, bool follow_olh,
-                                 optional_yield y, bool assume_noent)
+                                 optional_yield y, bool assume_noent,
+                                 const rgw_placement_rule *placement_rule)
 {
   if (obj.empty()) {
     return -EINVAL;
@@ -7478,7 +7522,8 @@ int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *oc
   s->obj = obj;
 
   rgw_raw_obj raw_obj;
-  obj_to_raw(bucket_info.placement_rule, obj, &raw_obj);
+  // use the caller's placement rule if given (e.g. a multipart part's tail placement)
+  obj_to_raw(placement_rule ? *placement_rule : bucket_info.placement_rule, obj, &raw_obj);
 
   int r = -ENOENT;
 
@@ -7655,14 +7700,15 @@ int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *oc
 int RGWRados::get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *octx,
                             RGWBucketInfo& bucket_info, const rgw_obj& obj,
                             RGWObjStateManifest** psm, bool follow_olh,
-                            optional_yield y, bool assume_noent)
+                            optional_yield y, bool assume_noent,
+                            const rgw_placement_rule *placement_rule)
 {
   int ret;
   unsigned attempts = 0;
 
   do {
     ret = get_obj_state_impl(dpp, octx, bucket_info, obj, psm,
-                             follow_olh, y, assume_noent);
+                             follow_olh, y, assume_noent, placement_rule);
   } while (ret == -EAGAIN && ++attempts < 5);
 
   return ret == -EAGAIN ? -ERR_SERVICE_UNAVAILABLE : ret;
@@ -7997,8 +8043,7 @@ int RGWRados::set_attrs(const DoutPrefixProvider *dpp, RGWObjectCtx* octx, RGWBu
                         map<string, bufferlist>& attrs,
                         map<string, bufferlist>* rmattrs,
                         optional_yield y,
-                        bool log_op,
-                        ceph::real_time set_mtime /* = zero() */)
+                        bool log_op)
 {
   rgw_obj obj = src_obj;
   if (obj.key.instance == "null") {
@@ -8097,8 +8142,10 @@ int RGWRados::set_attrs(const DoutPrefixProvider *dpp, RGWObjectCtx* octx, RGWBu
    * set the metadata.
    * Hence do not update mtime for any other attr changes */
   real_time mtime = state->mtime;
-  if (set_mtime != ceph::real_clock::zero()) {
-    mtime = set_mtime;
+  if (log_op) {
+    // make a tiny adjustment to the existing mtime so that fetch_remote_obj()
+    // won't return ERR_NOT_MODIFIED when syncing the modified object
+    mtime += ceph::timespan{std::chrono::nanoseconds{1}};
   }
   struct timespec mtime_ts = real_clock::to_timespec(mtime);
   op.mtime2(&mtime_ts);
@@ -8281,11 +8328,27 @@ int RGWRados::get_part_obj_state(const DoutPrefixProvider* dpp, optional_yield y
   }
   RGWObjStateManifest* sm = nullptr;
   constexpr bool follow_olh = false; // parts aren't versioned
+  // the part head is written with the upload's tail placement
+  const rgw_placement_rule& part_placement = manifest->get_tail_placement().placement_rule;
   int r = store->get_obj_state(dpp, rctx, bucket_info, *head_obj,
-                               &sm, follow_olh, y);
+                               &sm, follow_olh, y, false, &part_placement);
   if (r < 0) {
     return r;
   }
+
+  // for backward compatibility:
+  //   parts written before tracker #49128 (v16.2.8) have their head attrs in a zero-size object
+  //   in the bucket's default pool, and their data in the tail placement's pool without attrs
+  if (part_placement != bucket_info.placement_rule &&
+      (!sm->state.exists || !sm->state.attrset.count(RGW_ATTR_ETAG))) {
+    rctx->invalidate(*head_obj);
+    r = store->get_obj_state(dpp, rctx, bucket_info, *head_obj,
+                             &sm, follow_olh, y);
+    if (r < 0) {
+      return r;
+    }
+  }
+
   *pstate = &sm->state;
 
   // if the part has its own manifest, use it directly
@@ -8547,7 +8610,7 @@ int RGWRados::Bucket::UpdateIndex::guard_reshard(const DoutPrefixProvider *dpp, 
 {
   RGWRados *store = target->get_store();
   BucketShard *bs = nullptr;
-  int r;
+  int r = 0;
 
 #define NUM_RESHARD_RETRIES 10
   for (int i = 0; i < NUM_RESHARD_RETRIES; ++i) {
@@ -9117,6 +9180,23 @@ void RGWRados::olh_cancel_modification(const DoutPrefixProvider *dpp, const RGWB
     return;
   }
 
+  // for testing: hold the rollback, to reproduce a race with a concurrent
+  // overwrite of the head
+  if (cct->_conf->rgw_inject_delay_sec > 0 &&
+      std::string_view(cct->_conf->rgw_inject_delay_pattern) == "delay_olh_cancel_modification") {
+    ldpp_dout(dpp, 0) << __func__ << ": injecting delay of " << cct->_conf->rgw_inject_delay_sec
+                      << "s for " << olh_obj << dendl;
+    const auto delay = ceph::make_timespan(cct->_conf->rgw_inject_delay_sec);
+    if (y) {
+      auto yield = y.get_yield_context();
+      boost::asio::steady_timer timer{yield.get_executor(), delay};
+      boost::system::error_code ec;
+      timer.async_wait(yield[ec]);
+    } else {
+      std::this_thread::sleep_for(delay);
+    }
+  }
+
   rgw_rados_ref ref;
   int r = get_obj_head_ref(dpp, bucket_info, olh_obj, &ref);
   if (r < 0) {
@@ -9127,13 +9207,40 @@ void RGWRados::olh_cancel_modification(const DoutPrefixProvider *dpp, const RGWB
   attr_name.append(op_tag);
 
   // first remove the relevant pending prefix
-  ObjectWriteOperation op;
-  bucket_index_guard_olh_op(dpp, state, op);
-  op.rmxattr(attr_name.c_str());
-  r = rgw_rados_operate(dpp, ref.ioctx, ref.obj.oid, std::move(op), y);
+  auto remove_pending = [&] (const real_time& mtime, const bufferlist& obj_tag) {
+    ObjectWriteOperation op;
+    bucket_index_guard_olh_op(dpp, state, op);
+    // pin mtime only if the head object wasn't overwritten (RGW_ATTR_ID_TAG unchanged)
+    op.cmpxattr(RGW_ATTR_ID_TAG, CEPH_OSD_CMPXATTR_OP_EQ, obj_tag);
+    struct timespec mtime_ts = real_clock::to_timespec(mtime);
+    op.mtime2(&mtime_ts);
+    op.rmxattr(attr_name.c_str());
+    return rgw_rados_operate(dpp, ref.ioctx, ref.obj.oid, std::move(op), y);
+  };
+
+  // try to preserve the head object's original mtime
+  r = remove_pending(state.mtime, state.obj_tag);
+  // if received -ECANCELED, the head may have been overwritten
+  // then try to preserve its current mtime instead
+  constexpr int max_retries = 3;
+  for (int i = 0; r == -ECANCELED && i < max_retries; i++) {
+    real_time mtime;
+    map<string, bufferlist> attrs;
+    r = raw_obj_stat(dpp, ref.obj, nullptr, &mtime, nullptr, &attrs, nullptr, nullptr, y);
+    if (r < 0) {
+      break;
+    }
+    if (!attrs[RGW_ATTR_OLH_ID_TAG].contents_equal(state.olh_tag)) {
+      // olh itself removed/re-created, no need to retry anymore
+      r = -ECANCELED;
+      break;
+    }
+    r = remove_pending(mtime, attrs[RGW_ATTR_ID_TAG]);
+  }
+
   if (r < 0) {
     if (r != -ENOENT && r != -ECANCELED) {
-      ldpp_dout(dpp, 0) << __func__ << " target_obj=" << olh_obj << " rmxattr rgw_rados_operate() returned " << r << dendl;
+      ldpp_dout(dpp, 0) << __func__ << " target_obj=" << olh_obj << " removing olh pending xattr returned " << r << dendl;
     }
     return;
   }
@@ -9275,7 +9382,7 @@ int RGWRados::guard_reshard(const DoutPrefixProvider *dpp,
 {
   rgw_obj obj;
   const rgw_obj *pobj = &obj_instance;
-  int r;
+  int r = 0;
 
   for (int i = 0; i < NUM_RESHARD_RETRIES; ++i) {
     r = bs->init(pobj->bucket, *pobj, nullptr /* no RGWBucketInfo */, dpp, y);
@@ -10316,7 +10423,7 @@ int RGWRados::set_olh(const DoutPrefixProvider *dpp, RGWObjectCtx& obj_ctx,
       // object from being cleaned by another thread that was deleting the last
       // existing version. We invoke a best-effort update_olh here to handle this case.
       if (! skip_olh_obj_update) {
-        int r = update_olh(dpp, obj_ctx, state, bucket_info, olh_obj, y, zones_trace, log_data_change);
+        int r = update_olh(dpp, obj_ctx, state, bucket_info, olh_obj, y, zones_trace, false /* null_verid */, log_data_change);
         if (r < 0 && r != -ECANCELED) {
           ldpp_dout(dpp, 20) << "update_olh() target_obj=" << olh_obj << " returned " << r << dendl;
         }
@@ -10337,7 +10444,7 @@ int RGWRados::set_olh(const DoutPrefixProvider *dpp, RGWObjectCtx& obj_ctx,
     return 0;
   }
 
-  ret = update_olh(dpp, obj_ctx, state, bucket_info, olh_obj, y, zones_trace, log_data_change);
+  ret = update_olh(dpp, obj_ctx, state, bucket_info, olh_obj, y, zones_trace, false /* null_verid */, log_data_change);
   if (ret == -ECANCELED) { /* already did what we needed, no need to retry, raced with another user */
     ret = 0;
   }
@@ -10532,10 +10639,33 @@ int RGWRados::remove_olh_pending_entries(const DoutPrefixProvider *dpp, const RG
   // trim no more than 1000 entries per osd op
   constexpr int max_entries = 1000;
 
+  // read the head's current mtime and ID_TAG: the caller's state can be stale, e.g. in
+  // clear_olh() it's cached from before apply_olh_log() removed the null version's data
+  real_time mtime;
+  map<string, bufferlist> attrs;
+  r = raw_obj_stat(dpp, ref.obj, nullptr, &mtime, nullptr, &attrs, nullptr, nullptr, y);
+  if (r == -ENOENT) {
+    return 0;
+  }
+  if (r < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: " << __func__ << ": could not stat oid \"" << ref.obj.oid << "\", r=" << r << dendl;
+    return r;
+  }
+  struct timespec mtime_ts = real_clock::to_timespec(mtime);
+  // a head without the tag (e.g. its data was removed by apply_olh_log()) compares as empty
+  // cmpxattr below also checks that the tag is still absent
+  bufferlist obj_tag;
+  if (auto it = attrs.find(RGW_ATTR_ID_TAG); it != attrs.end()) {
+    obj_tag = it->second;
+  }
+
   auto i = pending_attrs.begin();
   while (i != pending_attrs.end()) {
     ObjectWriteOperation op;
     bucket_index_guard_olh_op(dpp, state, op);
+    // preserve the head object's mtime, unless it was overwritten since we read it
+    op.cmpxattr(RGW_ATTR_ID_TAG, CEPH_OSD_CMPXATTR_OP_EQ, obj_tag);
+    op.mtime2(&mtime_ts);
 
     for (int n = 0; n < max_entries && i != pending_attrs.end(); ++n, ++i) {
       op.rmxattr(i->first.c_str());

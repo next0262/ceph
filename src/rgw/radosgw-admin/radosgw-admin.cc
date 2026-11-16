@@ -6,9 +6,9 @@
  */
 
 #include <cerrno>
+#include <optional>
 #include <string>
 #include <sstream>
-#include <optional>
 #include <iostream>
 
 #include <boost/asio/co_spawn.hpp>
@@ -1334,6 +1334,57 @@ int set_user_ratelimit(OPT opt_cmd, std::unique_ptr<rgw::sal::User>& user,
   return 0;
 }
 
+int set_account_ratelimit(OPT opt_cmd, rgw_account_id& account_id,
+                     int64_t max_read_ops, int64_t max_write_ops, int64_t max_list_ops,
+                     int64_t max_delete_ops, int64_t max_read_bytes, int64_t max_write_bytes,
+                     bool have_max_read_ops, bool have_max_write_ops, bool have_max_list_ops,
+                     bool have_max_delete_ops, bool have_max_read_bytes, bool have_max_write_bytes)
+{
+  RGWAccountInfo account_info;
+  rgw::sal::Attrs account_attrs;
+  RGWObjVersionTracker tracker;
+  int r = driver->load_account_by_id(dpp(), null_yield, account_id, account_info,
+                              account_attrs, tracker);
+  if (r < 0) {
+    cerr << "could not get account info for account=" << account_id << ": " << cpp_strerror(-r) << std::endl;
+    return -r;
+  }
+  RGWRateLimitInfo account_ratelimit_info;
+  auto iter = account_attrs.find(RGW_ATTR_RATELIMIT);
+  if (iter != account_attrs.end()) {
+    try {
+      bufferlist& bl = iter->second;
+      auto biter = bl.cbegin();
+      decode(account_ratelimit_info, biter);
+    } catch (buffer::error& err) {
+      ldpp_dout(dpp(), 0) << "ERROR: failed to decode rate limit" << dendl;
+      return -EIO;
+    }
+  }
+
+  bool ratelimit_configured = set_ratelimit_info(account_ratelimit_info, opt_cmd, max_read_ops, max_write_ops, max_list_ops,
+                         max_delete_ops, max_read_bytes, max_write_bytes,
+                         have_max_read_ops, have_max_write_ops, have_max_list_ops,
+                         have_max_delete_ops, have_max_read_bytes, have_max_write_bytes);
+  if (!ratelimit_configured) {
+    ldpp_dout(dpp(), 0) << "ERROR: no rate limit values have been specified" << dendl;
+    return -EINVAL;
+  }
+
+  bufferlist bl;
+  account_ratelimit_info.encode(bl);
+  account_attrs[RGW_ATTR_RATELIMIT] = bl;
+  constexpr bool exclusive = false;
+  r = driver->store_account(dpp(), null_yield, exclusive, account_info, &account_info,
+                              account_attrs, tracker);
+  if (r < 0) {
+    cerr << "could not store account info for account=" << account_id << ": " << cpp_strerror(-r) << std::endl;
+    return -r;
+  }
+
+  return 0;
+}
+
 int show_user_ratelimit(std::unique_ptr<rgw::sal::User>& user, Formatter *formatter)
 {
   RGWRateLimitInfo ratelimit_info;
@@ -1384,6 +1435,38 @@ int show_bucket_ratelimit(rgw::sal::Driver* driver, const string& tenant_name,
   }
   formatter->open_object_section("bucket_ratelimit");
   encode_json("bucket_ratelimit", ratelimit_info, formatter);
+  formatter->close_section();
+  formatter->flush(cout);
+  cout << std::endl;
+  return 0;
+}
+
+int show_account_ratelimit(rgw::sal::Driver* driver, const rgw_account_id& account_id,
+                          Formatter *formatter)
+{
+  RGWAccountInfo account_info;
+  rgw::sal::Attrs account_attrs;
+  RGWObjVersionTracker tracker;
+  int r = driver->load_account_by_id(dpp(), null_yield, account_id, account_info,
+                              account_attrs, tracker);
+  if (r < 0) {
+    cerr << "could not get account info for account=" << account_id << ": " << cpp_strerror(-r) << std::endl;
+    return -r;
+  }
+  RGWRateLimitInfo account_ratelimit_info;
+  auto iter = account_attrs.find(RGW_ATTR_RATELIMIT);
+  if (iter != account_attrs.end()) {
+    try {
+      bufferlist& bl = iter->second;
+      auto biter = bl.cbegin();
+      decode(account_ratelimit_info, biter);
+    } catch (buffer::error& err) {
+      ldpp_dout(dpp(), 0) << "ERROR: failed to decode rate limit" << dendl;
+      return -EIO;
+    }
+  }
+  formatter->open_object_section("account_ratelimit");
+  encode_json("account_ratelimit", account_ratelimit_info, formatter);
   formatter->close_section();
   formatter->flush(cout);
   cout << std::endl;
@@ -4872,6 +4955,13 @@ int main(int argc, const char **argv)
                          have_max_read_ops, have_max_write_ops, have_max_list_ops,
                          have_max_delete_ops, have_max_read_bytes, have_max_write_bytes);
           encode_json("user_ratelimit", period_config.user_ratelimit, formatter.get());
+        } else if (ratelimit_scope == "account") {
+          ratelimit_configured = set_ratelimit_info(period_config.account_ratelimit, opt_cmd,
+                         max_read_ops, max_write_ops, max_list_ops, max_delete_ops,
+                         max_read_bytes, max_write_bytes,
+                         have_max_read_ops, have_max_write_ops, have_max_list_ops,
+                         have_max_delete_ops, have_max_read_bytes, have_max_write_bytes);
+          encode_json("account_ratelimit", period_config.account_ratelimit, formatter.get());
         } else if (ratelimit_scope == "anonymous") {
           ratelimit_configured = set_ratelimit_info(period_config.anon_ratelimit, opt_cmd,
                          max_read_ops, max_write_ops, max_list_ops,max_delete_ops,
@@ -4884,6 +4974,7 @@ int main(int argc, const char **argv)
           encode_json("bucket_ratelimit", period_config.bucket_ratelimit, formatter.get());
           encode_json("user_ratelimit", period_config.user_ratelimit, formatter.get());
           encode_json("anonymous_ratelimit", period_config.anon_ratelimit, formatter.get());
+          encode_json("account_ratelimit", period_config.account_ratelimit, formatter.get());
         } else {
           cerr << "ERROR: invalid rate limit scope specification. Please specify "
               "either --ratelimit-scope=bucket, or --ratelimit-scope=user or --ratelimit-scope=anonymous" << std::endl;
@@ -6769,8 +6860,17 @@ int main(int argc, const char **argv)
   if (!(rgw::sal::User::empty(user) && access_key.empty()) || !subuser.empty()) {
     ret = ruser.init(dpp(), driver, user_op, null_yield);
     if (ret < 0) {
+      if (!access_key.empty() && !user_op.found_by_key) {
+        cerr << "ERROR: could not find user for access-key: "
+             << access_key << std::endl;
+        return -ENOENT;
+      }
       cerr << "user.init failed: " << cpp_strerror(-ret) << std::endl;
       return -ret;
+    }
+    if (rgw::sal::User::empty(user) && !access_key.empty() &&
+        user_op.found_by_key) {
+      bucket_op.set_user_id(user_op.get_user_id());
     }
   }
 
@@ -11649,8 +11749,8 @@ next:
   bool ratelimit_op_set = (opt_cmd == OPT::RATELIMIT_SET || opt_cmd == OPT::RATELIMIT_ENABLE || opt_cmd == OPT::RATELIMIT_DISABLE);
   bool ratelimit_op_get = opt_cmd == OPT::RATELIMIT_GET;
   if (ratelimit_op_set) {
-    if (bucket_name.empty() && rgw::sal::User::empty(user)) {
-      cerr << "ERROR: bucket name or uid is required for ratelimit operation" << std::endl;
+    if (bucket_name.empty() && rgw::sal::User::empty(user) && account_id.empty()) {
+      cerr << "ERROR: bucket name or uid or account id is required for ratelimit operation" << std::endl;
       return EINVAL;
     }
 
@@ -11674,12 +11774,22 @@ next:
         cerr << "ERROR: invalid ratelimit scope specification. Please specify either --ratelimit-scope=bucket, or --ratelimit-scope=user" << std::endl;
         return EINVAL;
       }
+    } else if (!account_id.empty()) {
+      if (ratelimit_scope == "account") {
+        return set_account_ratelimit(opt_cmd, account_id, max_read_ops, max_write_ops, max_list_ops, max_delete_ops,
+                         max_read_bytes, max_write_bytes,
+                         have_max_read_ops, have_max_write_ops, have_max_list_ops, have_max_delete_ops,
+                         have_max_read_bytes, have_max_write_bytes);
+      } else {
+        cerr << "ERROR: invalid ratelimit scope specification. Please specify either --ratelimit-scope=bucket, or --ratelimit-scope=user" << std::endl;
+        return EINVAL;
+      }
     }
   }
 
   if (ratelimit_op_get) {
-    if (bucket_name.empty() && rgw::sal::User::empty(user)) {
-      cerr << "ERROR: bucket name or uid is required for ratelimit operation" << std::endl;
+    if (bucket_name.empty() && rgw::sal::User::empty(user) && account_id.empty()) {
+      cerr << "ERROR: bucket name or uid or account id is required for ratelimit operation" << std::endl;
       return EINVAL;
     }
 
@@ -11701,6 +11811,15 @@ next:
         cerr << "ERROR: invalid ratelimit scope specification. Please specify either --ratelimit-scope=bucket, or --ratelimit-scope=user" << std::endl;
         return EINVAL;
       }
+    } else if (!account_id.empty()) {
+      if (ratelimit_scope == "account") {
+        int ret = show_account_ratelimit(driver, account_id, formatter.get());
+        if (ret < 0) {
+          std::cerr << "ERROR: failed to get a ratelimit for user id: '" << user->get_id() << "', errno: " << cpp_strerror(-ret) << std::endl;
+        }
+        return ret;
+      }
+      
     }
   }
 
@@ -12343,32 +12462,74 @@ next:
     }
 
     auto ioctx = static_cast<rgw::sal::RadosStore*>(driver)->getRados()->get_notif_pool_ctx();
-    std::string marker;
-    std::string end_marker;
-    librados::ObjectReadOperation rop;
-    std::vector<cls_queue_entry> queue_entries;
-    bool truncated;
+    // the queue is sharded, so a marker has to hold both the shard it refers
+    // to and the position inside that shard: <shard index>#<queue marker>
+    uint64_t start_shard = 0;
+    std::string start_queue_marker;
+    if (!marker.empty()) {
+      const auto pos = marker.find('#');
+      std::string parse_err;
+      if (pos == std::string::npos) {
+        cerr << "ERROR: invalid marker: " << marker << std::endl;
+        return EINVAL;
+      }
+      start_shard = strict_strtoll(marker.substr(0, pos).c_str(), 10, &parse_err);
+      if (!parse_err.empty() || start_shard >= topic.dest.num_shards) {
+        cerr << "ERROR: invalid marker: " << marker << std::endl;
+        return EINVAL;
+      }
+      start_queue_marker = marker.substr(pos + 1);
+      // the position inside the shard, when there is one, is a queue marker
+      cls_queue_marker queue_pos;
+      if (!start_queue_marker.empty() &&
+          queue_pos.from_str(start_queue_marker.c_str()) != 0) {
+        cerr << "ERROR: invalid marker: " << marker << std::endl;
+        return EINVAL;
+      }
+    }
+
+    // total number of entries returned to the caller. zero means no limit.
+    // clamped to at least one, as in "bi list"
+    const uint32_t max_to_return = max_entries_specified ? std::max(1, max_entries) : 0;
+    // number of entries fetched from the queue in a single call
+    constexpr uint32_t max_fetched = 1000;
+    uint32_t returned = 0;
+    bool page_full = false;
+    bool more = false;
+    std::string next_marker;
+
+    formatter->open_object_section("result");
     formatter->open_array_section("eventEntries");
 
+    uint64_t shard_index = 0;
     for (const auto& shard_name: topic.dest.get_shard_names()){
-      truncated = true; 
-      marker.clear();
-      while (truncated) {
+      if (shard_index < start_shard) {
+        ++shard_index;
+        continue;
+      }
+      std::string queue_marker = (shard_index == start_shard) ? start_queue_marker : "";
+      bool truncated = true;
+      while (truncated && !page_full) {
+        const auto to_fetch = (max_to_return == 0) ?
+          max_fetched : std::min(max_fetched, max_to_return - returned);
+        librados::ObjectReadOperation rop;
+        std::vector<cls_queue_entry> queue_entries;
+        std::string end_marker;
         bufferlist bl;
         int rc;
-        cls_2pc_queue_list_entries(rop, marker, max_entries, &bl, &rc);
+        cls_2pc_queue_list_entries(rop, queue_marker, to_fetch, &bl, &rc);
         ioctx.operate(shard_name, &rop, nullptr);
         if (rc < 0 ) {
-          cerr << "ERROR: could not list entries from queue. error: " << cpp_strerror(-ret) << std::endl;
+          cerr << "ERROR: could not list entries from queue. error: " << cpp_strerror(-rc) << std::endl;
           return -rc;
         }
         rc = cls_2pc_queue_list_entries_result(bl, queue_entries, &truncated, end_marker);
         if (rc < 0) {
-          cerr << "ERROR: failed to parse list entries from queue (skipping). error: " << cpp_strerror(-ret) << std::endl;
+          cerr << "ERROR: failed to parse list entries from queue. error: " << cpp_strerror(-rc) << std::endl;
           return -rc;
         }
-        std::for_each(queue_entries.cbegin(), 
-          queue_entries.cend(), 
+        std::for_each(queue_entries.cbegin(),
+          queue_entries.cend(),
           [&formatter](const auto& queue_entry) {
             rgw::notify::event_entry_t event_entry;
             bufferlist::const_iterator iter{&queue_entry.data};
@@ -12380,9 +12541,27 @@ next:
             }
           });
         formatter->flush(cout);
-        marker = end_marker;
+        returned += queue_entries.size();
+        queue_marker = end_marker;
+        page_full = (max_to_return > 0 && returned >= max_to_return);
       }
+      if (page_full) {
+        // resume from where this shard stopped, or from the next shard if it
+        // was fully listed
+        if (truncated) {
+          next_marker = fmt::format("{}#{}", shard_index, queue_marker);
+          more = true;
+        } else if (shard_index + 1 < topic.dest.num_shards) {
+          next_marker = fmt::format("{}#", shard_index + 1);
+          more = true;
+        }
+        break;
+      }
+      ++shard_index;
     }
+    formatter->close_section();
+    formatter->dump_bool("truncated", more);
+    formatter->dump_string("marker", next_marker);
     formatter->close_section();
     formatter->flush(cout);
   }

@@ -208,6 +208,7 @@ class ResourceErrorStatus(TypedDict, total=False):
     other_cluster_id: str
     shares: List[str]
     unknown_id: str
+    existing_values: List[Dict]
 
 
 class ErrorResult(ResourceResult, Exception):
@@ -260,6 +261,16 @@ class ResultGroup:
 
     def append(self, result: Result) -> None:
         self._contents.append(result)
+
+    def replace(self, result: Result) -> None:
+        """Replace or append a result without merging incompatible metadata."""
+        key = self._rkey(result)
+        if key:
+            for index, previous in enumerate(self._contents):
+                if self._rkey(previous) == key:
+                    self._contents[index] = result
+                    return
+        self.append(result)
 
     def one(self) -> Result:
         return one(self._contents)
@@ -355,7 +366,11 @@ class ResultGroup:
     def _rkey(self, result: Result) -> str:
         if not isinstance(result, ResourceResult):
             return ''  # to be ignored by caller
-        ns, rk = resource_key(result.src)
+        try:
+            ns, rk = resource_key(result.src)
+        except TypeError:
+            # apply() can wrap a standalone resource component in ErrorResult.
+            return ''  # no resource key; append without replacing
         return f'ResourceResult:{ns}:{rk}'
 
     def merge(self, other: Iterable[Result]) -> None:

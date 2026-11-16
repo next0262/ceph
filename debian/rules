@@ -29,6 +29,12 @@ endif
 ifneq ($(filter pkg.ceph.system-rdkafka,$(DEB_BUILD_PROFILES)),)
   extraopts += -DWITH_SYSTEM_RDKAFKA=ON
 endif
+ifneq ($(filter pkg.ceph.fdb,$(DEB_BUILD_PROFILES)),)
+  extraopts += -DWITH_RADOSGW_FDB=ON
+  fdb_dep = foundationdb-clients (>= 7.3)
+else
+  extraopts += -DWITH_RADOSGW_FDB=OFF
+endif
 
 extraopts += -DWITH_JAEGER=ON
 extraopts += -DWITH_SYSTEM_JERASURE=ON
@@ -155,6 +161,11 @@ override_dh_strip:
 override_dh_shlibdeps:
 	dh_shlibdeps -a --exclude=erasure-code --exclude=rados-classes --exclude=compressor --exclude=ceph_crypto
 
+# The FoundationDB client DEB does not supply shared-library dependency metadata.
+override_dh_gencontrol:
+	dh_gencontrol -pceph-common -plibrgw2 -pradosgw -- -V'fdb:Depends=$(fdb_dep)'
+	dh_gencontrol --remaining-packages
+
 override_dh_python3:
 	@for binding in $(py3_bindings); do \
 	  dh_python3 -p python3-$$binding;  \
@@ -170,7 +181,12 @@ override_dh_python3:
 	dh_python3 -p ceph-fuse --shebang=/usr/bin/python3
 	dh_python3 -p ceph-volume --shebang=/usr/bin/python3
 
+# match the RPM's %attr(0700,root,root) for the cephadm invoker
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0700 debian/cephadm/usr/libexec/cephadm_invoker.py
+
 # do not run tests
 override_dh_auto_test:
 
-.PHONY: override_dh_autoreconf override_dh_auto_configure override_dh_auto_clean override_dh_auto_install override_dh_installlogrotate override_dh_installinit override_dh_strip override_dh_auto_test
+.PHONY: override_dh_autoreconf override_dh_auto_configure override_dh_auto_clean override_dh_auto_install override_dh_installlogrotate override_dh_installinit override_dh_strip override_dh_fixperms override_dh_auto_test

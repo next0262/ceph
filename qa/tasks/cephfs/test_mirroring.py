@@ -14,7 +14,7 @@ from collections import deque
 from datetime import datetime
 
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
-from teuthology.exceptions import CommandFailedError
+from teuthology.exceptions import CommandFailedError, MaxWhileTries
 from teuthology.contextutil import safe_while
 from teuthology.orchestra import run
 
@@ -47,21 +47,26 @@ def retry_assert(timeout=60, interval=1):
             last_exc = None
             attempt = 1
 
-            with safe_while(sleep=interval, tries=tries, action=f"retry {func.__name__}") as proceed:
-                while proceed():
-                    try:
-                        return func(*args, **kwargs)
-                    except RETRY_EXCEPTIONS as e:
-                        last_exc = e
-                        log.debug(
-                            f"[retry_assert] {func.__name__}: "
-                            f"attempt {attempt} failed ({type(e).__name__}), retrying..."
-                        )
-                        attempt += 1
-            # Final failure
+            try:
+                with safe_while(sleep=interval, tries=tries,
+                                action=f"retry {func.__name__}") as proceed:
+                    while proceed():
+                        try:
+                            return func(*args, **kwargs)
+                        except RETRY_EXCEPTIONS as e:
+                            last_exc = e
+                            log.debug(
+                                f"[retry_assert] {func.__name__}: "
+                                f"attempt {attempt} failed ({type(e).__name__}), retrying..."
+                            )
+                            attempt += 1
+            except MaxWhileTries:
+                pass
+
+            # Final failure — log last peer status if the helper attached it
             if last_exc is not None and hasattr(last_exc, "res"):
                 log.error("\n--- Last peer status (res) ---")
-                log.error(last_exc.res)
+                log.error("%s", last_exc.res)
 
             raise AssertionError(
                 f"{func.__name__} did not succeed within {timeout}s "
@@ -783,8 +788,9 @@ class TestMirroring(CephFSTestCase):
 
     @retry_assert(timeout=60, interval=1)
     def check_peer_snap_in_progress(self, fs_name, fs_id,
-                                    peer_spec, dir_name, snap_name, timeout=60, interval=1):
+                                    peer_spec, dir_name, snap_name):
         peer_uuid = self.get_peer_uuid(peer_spec)
+        res = None
         try:
             res = self.mirror_daemon_command(f'peer status for fs: {fs_name}',
                                              'fs', 'mirror', 'peer', 'status',
@@ -1063,6 +1069,13 @@ class TestMirroring(CephFSTestCase):
     def check_checkpoint_statuses(self, fs_name, dir_path, snap_names, expected_status):
         for snap_name in snap_names:
             self.check_checkpoint_status(fs_name, dir_path, snap_name, expected_status)
+
+    @retry_assert(timeout=300, interval=5)
+    def check_checkpoint_list_snap_names(self, fs_name, dir_path, expected_names):
+        res = self.checkpoint_list(fs_name, dir_path)
+        names = [cp['snap_name'] for cp in res['checkpoints']]
+        self.assertEqual(sorted(names), sorted(expected_names),
+                         f'expected checkpoints {expected_names}, got {names}')
 
     def setup_mount_b(self, mds_perm):
         log.debug('reconfigure client auth caps')
@@ -1514,12 +1527,205 @@ class TestMirroring(CephFSTestCase):
 
         self._teardown_mirroring(dir_path, peer_spec)
 
+    def test_checkpoint_auto_prune_old_complete(self):
+        """Old COMPLETE checkpoints are pruned down to keep_count on initialize.
+
+        Sync more than keep_count COMPLETE checkpoints first (prune does not run
+        on the sync path). Restarting the mirror daemon re-acquires the directory
+        and runs initialize_checkpoints(), which prunes the oldest already-COMPLETE
+        checkpoints. Snapshots themselves must remain.
+
+        Also verifies that updating cephfs_mirror_checkpoint_keep_count is honored
+        by the daemon (override below; restored via addCleanup).
+        """
+        keep_count = 3
+        dir_path = '/cp_prune'
+        dir_name = dir_path.lstrip('/')
+        peer_spec = "client.mirror_remote@ceph"
+        snap_names = [f'snap{i}' for i in range(keep_count + 2)]
+        expected_kept = snap_names[-keep_count:]
+        expected_pruned = snap_names[:-keep_count]
+
+        # Override keep_count so this test also covers config update pickup
+        self.config_set('client.mirror', 'cephfs_mirror_checkpoint_keep_count',
+                        keep_count)
+        self.addCleanup(self.config_rm, 'client.mirror',
+                        'cephfs_mirror_checkpoint_keep_count')
+
+        self._setup_mirrored_directory(dir_path, peer_spec=peer_spec, mount_b=True)
+
+        for snap_name in snap_names:
+            self._add_checkpoint_snapshot(dir_path, snap_name)
+
+        # Wait until all snapshots have been synced.  Do not assert all
+        # checkpoints are COMPLETE or count them before the restart: each
+        # checkpoint_add sends an acquire notification that can trigger
+        # initialize_checkpoints() and prune older already-COMPLETE entries
+        # before the loop finishes.
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, dir_path, snap_names[-1], len(snap_names))
+
+        # Re-acquire directories so initialize_checkpoints() prunes already-COMPLETE
+        self.restart_mirror_daemon()
+
+        self.check_checkpoint_list_snap_names(
+            self.primary_fs_name, dir_path, expected_kept)
+        self.check_checkpoint_statuses(
+            self.primary_fs_name, dir_path, expected_kept, 'complete')
+        for snap_name in expected_pruned:
+            self.assert_checkpoint_not_listed(
+                self.primary_fs_name, dir_path, snap_name)
+
+        # Prune removes checkpoint metadata only; snapshots remain
+        snap_list = self.mount_a.ls(path=f'{dir_name}/.snap')
+        for snap_name in snap_names:
+            self.assertIn(snap_name, snap_list)
+
+        self._teardown_mirroring(dir_path, peer_spec)
+
+    def test_checkpoint_auto_prune_on_checkpoint_add(self):
+        """checkpoint add triggers initialize_checkpoints() and prunes old COMPLETE.
+
+        After more than keep_count COMPLETE checkpoints exist, adding a
+        checkpoint on a newly synced snapshot sends an acquire notify. The new
+        checkpoint is marked COMPLETE in that pass (so it is not pruned), while
+        older already-COMPLETE checkpoints are removed down to keep_count.
+        keep_count is set to 3.
+        """
+        keep_count = 3
+        dir_path = '/cp_prune_add'
+        dir_name = dir_path.lstrip('/')
+        peer_spec = "client.mirror_remote@ceph"
+        existing = [f'snap{i}' for i in range(keep_count + 2)]
+        new_snap = f'snap{len(existing)}'
+        # already-COMPLETE after prune: newest (keep_count - 1), plus the new one
+        expected_kept = existing[-(keep_count - 1):] + [new_snap]
+        expected_pruned = existing[:-(keep_count - 1)]
+
+        self.config_set('client.mirror', 'cephfs_mirror_checkpoint_keep_count',
+                        keep_count)
+        self.addCleanup(self.config_rm, 'client.mirror',
+                        'cephfs_mirror_checkpoint_keep_count')
+
+        self._setup_mirrored_directory(dir_path, peer_spec=peer_spec, mount_b=True)
+
+        for snap_name in existing:
+            self._add_checkpoint_snapshot(dir_path, snap_name)
+
+        # Wait until all existing snapshots have been synced.  Do not assert
+        # all existing checkpoints are COMPLETE here: each checkpoint_add
+        # sends an acquire notification that can trigger initialize_checkpoints()
+        # and prune older already-COMPLETE entries before the loop finishes.
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, dir_path, existing[-1], len(existing))
+
+        # Sync one more snapshot, then checkpoint it to trigger initialize/prune
+        self.mount_a.run_shell(["mkdir", f"{dir_name}/.snap/{new_snap}"])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, dir_path, new_snap, len(existing) + 1)
+        self.checkpoint_add(self.primary_fs_name, dir_path, new_snap)
+
+        self.check_checkpoint_list_snap_names(
+            self.primary_fs_name, dir_path, expected_kept)
+        self.check_checkpoint_statuses(
+            self.primary_fs_name, dir_path, expected_kept, 'complete')
+        for snap_name in expected_pruned:
+            self.assert_checkpoint_not_listed(
+                self.primary_fs_name, dir_path, snap_name)
+
+        snap_list = self.mount_a.ls(path=f'{dir_name}/.snap')
+        for snap_name in existing + [new_snap]:
+            self.assertIn(snap_name, snap_list)
+
+        self._teardown_mirroring(dir_path, peer_spec)
+
+    def test_checkpoint_created_and_failed_not_auto_pruned(self):
+        """CREATED and FAILED checkpoints stay listed when COMPLETE ones are pruned.
+
+        Auto prune removes only checkpoints that are already COMPLETE. A
+        checkpoint whose snapshot has not been synced stays CREATED, and a
+        checkpoint whose sync failed stays FAILED. Snapshots themselves remain.
+        """
+        keep_count = 3
+        dir_path = '/cp_prune_non_complete'
+        dir_name = dir_path.lstrip('/')
+        peer_spec = "client.mirror_remote@ceph"
+        complete = [f'snap{i}' for i in range(keep_count + 2)]
+        snap_failed = 'snap_failed'
+        snap_created = 'snap_created'
+        expected_kept_complete = complete[-keep_count:]
+        expected_pruned = complete[:-keep_count]
+        expected_listed = expected_kept_complete + [snap_failed, snap_created]
+
+        self.config_set('client.mirror', 'cephfs_mirror_checkpoint_keep_count',
+                        keep_count)
+        self.addCleanup(self.config_rm, 'client.mirror',
+                        'cephfs_mirror_checkpoint_keep_count')
+        self.addCleanup(self._restore_mirror_remote_caps)
+
+        self._setup_mirrored_directory(dir_path, peer_spec=peer_spec, mount_b=True)
+
+        for snap_name in complete:
+            self._add_checkpoint_snapshot(dir_path, snap_name)
+
+        # Wait until all complete snapshots have been synced.  Do not assert
+        # all complete checkpoints are COMPLETE here: each checkpoint_add
+        # sends an acquire notification that can trigger initialize_checkpoints()
+        # and prune older already-COMPLETE entries before the loop finishes.
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, dir_path, complete[-1], len(complete))
+
+        # Publish read-only remote caps before the daemon stops, so a respawn
+        # picks them up. Create snap_failed first: sync walks snapshots in
+        # snap-id order and returns on the first failure, leaving snap_created
+        # unsynced.
+        self._restrict_mirror_remote_caps()
+        self.stop_mirror_daemon()
+        self.mount_a.write_n_mb(f'{dir_name}/data', 1)
+        self.mount_a.run_shell(["mkdir", f"{dir_name}/.snap/{snap_failed}"])
+        self.checkpoint_add(self.primary_fs_name, dir_path, snap_failed)
+        self.mount_a.run_shell(["mkdir", f"{dir_name}/.snap/{snap_created}"])
+        self.checkpoint_add(self.primary_fs_name, dir_path, snap_created)
+        self.check_checkpoint_statuses(
+            self.primary_fs_name, dir_path, [snap_failed, snap_created], 'created')
+
+        self.start_mirror_daemon()
+
+        self.check_checkpoint_status(
+            self.primary_fs_name, dir_path, snap_failed, 'failed')
+        self.check_checkpoint_status(
+            self.primary_fs_name, dir_path, snap_created, 'created')
+        self.check_checkpoint_statuses(
+            self.primary_fs_name, dir_path, expected_kept_complete, 'complete')
+        self.check_checkpoint_list_snap_names(
+            self.primary_fs_name, dir_path, expected_listed)
+        for snap_name in expected_pruned:
+            self.assert_checkpoint_not_listed(
+                self.primary_fs_name, dir_path, snap_name)
+
+        snap_list = self.mount_a.ls(path=f'{dir_name}/.snap')
+        for snap_name in complete + [snap_failed, snap_created]:
+            self.assertIn(snap_name, snap_list)
+
+        self._restore_mirror_remote_caps()
+        self._teardown_mirroring(dir_path, peer_spec)
+
     def test_checkpoint_add_directory_notify_perf_counter(self):
         """Each checkpoint add must notify the mirror daemon via add_directory()."""
         snap_count = 100
         dir_path = '/cp_add_dir_notify'
         dir_name = dir_path.lstrip('/')
         peer_spec = "client.mirror_remote@ceph"
+
+        # Raise keep_count to snap_count so pruning does not interfere: this
+        # test creates snap_count checkpoints and asserts all snap_count are
+        # listed.  The default keep_count (10) would prune old COMPLETE
+        # checkpoints as sync progresses, leaving far fewer than snap_count
+        # entries by the time checkpoint_list is called.
+        self.config_set('client.mirror', 'cephfs_mirror_checkpoint_keep_count',
+                        snap_count)
+        self.addCleanup(self.config_rm, 'client.mirror',
+                        'cephfs_mirror_checkpoint_keep_count')
 
         self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
         self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
@@ -1586,6 +1792,112 @@ class TestMirroring(CephFSTestCase):
         res = self.checkpoint_list(self.primary_fs_name, dir_path)
         cp = self.find_checkpoint(res['checkpoints'], snap_name)
         self.assertNotIn('error_msg', cp)
+
+        self._teardown_mirroring(dir_path, peer_spec)
+
+    def test_checkpoint_remove_during_sync(self):
+        """Removing a checkpoint during sync must not recreate it on completion.
+
+        The bug only reproduces if the checkpoint is removed while the mirror
+        is still syncing that snap: on completion the daemon must not recreate
+        checkpoint metadata from a stale client cache. If remove runs after
+        sync already finished, the test misses that path.
+
+        Sync can finish before the test observes `syncing` (especially on a
+        fast host). Increasing payload alone stays flaky under variable
+        teuthology load; if the window is missed, dirty the tree and start
+        another checkpointed snap for a fresh chance.
+
+        Once syncing is observed, briefly SIGSTOP (freeze) the mirror daemon
+        so sync cannot advance to completion while we remove the checkpoint
+        via mgr/MDS (no asok dependency while frozen). SIGCONT then lets sync
+        finish so we can assert the checkpoint stays gone. Keep the freeze
+        well under InstanceWatcher.INSTANCE_TIMEOUT (30s) to avoid mgr
+        blocklisting the daemon.
+        """
+        dir_path = '/cp_remove_sync'
+        peer_spec = "client.mirror_remote@ceph"
+
+        self._setup_mirrored_directory(dir_path, mount_b=True)
+        dir_name = dir_path.lstrip('/')
+        self.mount_a.create_n_files(f'{dir_name}/file', 10000, sync=True)
+        for i in range(20):
+            self.mount_a.write_n_mb(os.path.join(dir_name, f'large_file.{i}'), 100)
+
+        # Peer first so each new snap starts syncing immediately (no peer_add
+        # sleep between checkpoint create and the syncing poll).
+        self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                      self.secondary_fs_name)
+
+        self._add_checkpoint_snapshot(dir_path, 'snap0', verify_listed=True)
+
+        next_snap = 1
+        max_extra_snaps = 5
+        snaps_synced_before_create = None
+        caught_snap = None
+        expected_synced_count = None
+        peer_uuid = self.get_peer_uuid(peer_spec)
+
+        with safe_while(sleep=1, tries=90,
+                        action='catch syncing for checkpoint remove') as proceed:
+            while proceed():
+                dir_stat = self.dir_status_from_asok(
+                    self.primary_fs_name, self.primary_fs_id, dir_path,
+                    peer_uuid)
+                if dir_stat.get('state') == 'syncing':
+                    cur = dir_stat['current_syncing_snap']['name']
+                    cps = self.checkpoint_list(
+                        self.primary_fs_name, dir_path)['checkpoints']
+                    if self.find_checkpoint(cps, cur) is not None:
+                        caught_snap = cur
+                        expected_synced_count = dir_stat.get('snaps_synced', 0) + 1
+                        break
+                    continue
+
+                snaps_synced = dir_stat.get('snaps_synced', 0)
+                # Wait until the last extra snap is no longer queued before
+                # creating another or failing the cap.
+                if (snaps_synced_before_create is not None and
+                        snaps_synced <= snaps_synced_before_create):
+                    continue
+                if next_snap > max_extra_snaps:
+                    self.fail(
+                        f'exhausted {max_extra_snaps} extra snaps without '
+                        f'catching a syncing window; last state={dir_stat}')
+
+                self.mount_a.create_n_files(
+                    f'{dir_name}/extra_{next_snap}', 3000, sync=True)
+                for j in range(10):
+                    self.mount_a.write_n_mb(
+                        os.path.join(dir_name, f'large_file.{next_snap}.{j}'),
+                        100)
+                snap_name = f'snap{next_snap}'
+                self._add_checkpoint_snapshot(
+                    dir_path, snap_name, verify_listed=True)
+                snaps_synced_before_create = snaps_synced
+                next_snap += 1
+
+        # Freeze mid-sync so remove happens while sync is still in progress.
+        pid = self.get_mirror_daemon_pid()
+        log.debug('SIGSTOP to cephfs-mirror pid %s for checkpoint remove', pid)
+        self.mount_a.run_shell(['kill', '-SIGSTOP', pid])
+        try:
+            # mgr/MDS only — does not need asok while the daemon is frozen.
+            self.checkpoint_remove(self.primary_fs_name, dir_path, caught_snap)
+            self.assert_checkpoint_not_listed(
+                self.primary_fs_name, dir_path, caught_snap)
+        finally:
+            log.debug('SIGCONT to cephfs-mirror pid %s', pid)
+            self.mount_a.run_shell(['kill', '-SIGCONT', pid])
+
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, dir_path, caught_snap,
+                               expected_synced_count)
+        self.verify_snapshot(dir_name, caught_snap)
+
+        # Must stay gone after sync completes (no recreate on completion).
+        self.assert_checkpoint_not_listed(
+            self.primary_fs_name, dir_path, caught_snap)
 
         self._teardown_mirroring(dir_path, peer_spec)
 
@@ -1729,8 +2041,13 @@ class TestMirroring(CephFSTestCase):
         self.assertGreater(second["counters"]["snaps_synced"], first["counters"]["snaps_synced"])
         self.assertGreater(second["counters"]["last_synced_start"], first["counters"]["last_synced_start"])
         self.assertGreaterEqual(second["counters"]["last_synced_end"], second["counters"]["last_synced_start"])
-        self.assertGreater(second["counters"]["last_synced_duration"], 0)
-        self.assertEqual(second["counters"]["last_synced_bytes"], 1048576000) # last_synced_bytes = 10 files of 1024MB size each
+        # last_synced_* use whole-second timestamps; a sync finishing in the
+        # same second reports duration 0. Check consistency, not > 0.
+        self.assertEqual(
+            second["counters"]["last_synced_duration"],
+            second["counters"]["last_synced_end"] -
+            second["counters"]["last_synced_start"])
+        self.assertEqual(second["counters"]["last_synced_bytes"], 1048576000)  # 10 x 100 MiB
         peer_uuid = self.get_peer_uuid("client.mirror_remote@ceph")
         dir_second = self.get_directory_perf_counters('/d0', peer_uuid)
         self.assertEqual(dir_second['snaps_synced'], second["counters"]["snaps_synced"])
@@ -1752,8 +2069,11 @@ class TestMirroring(CephFSTestCase):
         self.assertGreater(third["counters"]["snaps_synced"], second["counters"]["snaps_synced"])
         self.assertGreater(third["counters"]["last_synced_start"], second["counters"]["last_synced_end"])
         self.assertGreaterEqual(third["counters"]["last_synced_end"], third["counters"]["last_synced_start"])
-        self.assertGreater(third["counters"]["last_synced_duration"], 0)
-        self.assertEqual(third["counters"]["last_synced_bytes"], 1572864000) # last_synced_bytes = 10 files of 1024MB size each
+        self.assertEqual(
+            third["counters"]["last_synced_duration"],
+            third["counters"]["last_synced_end"] -
+            third["counters"]["last_synced_start"])
+        self.assertEqual(third["counters"]["last_synced_bytes"], 1572864000)  # 15 x 100 MiB
 
         # delete a snapshot
         self.mount_a.run_shell(["rmdir", "d0/.snap/snap0"])
@@ -3052,7 +3372,7 @@ class TestMirroring(CephFSTestCase):
 
         remote_snap_name = 'snap_b'
         remote_snap_path = f'{dir_name}/.snap/{remote_snap_name}'
-        failure_reason = f"snapshot '{remote_snap_name}' has invalid metadata"
+        failure_reason = f"remote fs snapshot '{remote_snap_name}' has invalid metadata"
         dir_name = f'/{dir_name}'
 
         # create a directory in the remote fs and check status 'failed'
@@ -3959,18 +4279,34 @@ class TestMirroring(CephFSTestCase):
         self.check_peer_status_idle(self.primary_fs_name, self.primary_fs_id,
                                     peer_spec, f'/{dir_name}', snap0, 1)
 
-        res1 = self.mgr_mirror_status(self.primary_fs_name)
-        res2 = self.mgr_mirror_status(self.primary_fs_name)
-        self.assertEqual(res1, res2)
+        # TTL is bucketed via int(monotonic()/ttl); adjacent calls can straddle
+        # a bucket boundary and both miss, so retry until we see a cache hit.
+        with safe_while(sleep=0.1, tries=30,
+                        action='mgr metrics cache hit') as proceed:
+            while proceed():
+                res1 = self.mgr_mirror_status(self.primary_fs_name)
+                res2 = self.mgr_mirror_status(self.primary_fs_name)
+                if res1 == res2:
+                    break
 
         snap1 = 'snap1'
         self.mount_a.run_shell(['mkdir', f'{dir_name}/.snap/{snap1}'])
         self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
                                peer_spec, f'/{dir_name}', snap1, 2)
 
-        time.sleep(self.MGR_METRICS_CACHE_TTL + 1)
-        res3 = self.mgr_mirror_status(self.primary_fs_name)
+        # persist_dir_sync_stat() is an async AIO write; under valgrind the omap
+        # write may not have landed by the time check_peer_status() returns.
+        # Retry: sleep TTL+1 each iteration to ensure a fresh cache load, then
+        # assert the omap-persisted value has caught up with the in-memory count.
         peer_uuid = self.get_peer_uuid(peer_spec)
+        with safe_while(sleep=self.MGR_METRICS_CACHE_TTL + 1, tries=10,
+                        action='wait for mgr snaps_synced=2') as proceed:
+            while proceed():
+                res3 = self.mgr_mirror_status(self.primary_fs_name)
+                if (res3['metrics'].get(f'/{dir_name}', {})
+                        .get('peer', {}).get(peer_uuid, {})
+                        .get('snaps_synced') == 2):
+                    break
         self.assertEqual(
             res3['metrics'][f'/{dir_name}']['peer'][peer_uuid]['snaps_synced'], 2)
         self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)

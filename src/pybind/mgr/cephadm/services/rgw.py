@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING
 import errno
+import re
 from typing import List, Optional, Dict, Any, Tuple, cast
 from mgr_module import HandleCommandResult
 from ceph.deployment.service_spec import RGWSpec, ServiceSpec
@@ -72,9 +73,39 @@ class RgwService(CephService):
             if rgw_spec.rgw_frontend_extra_args:
                 frontend_parts.append(
                     f'extra_args={sorted(rgw_spec.rgw_frontend_extra_args)}')
+            # only added when used, so the dependency (and therefore the
+            # hash) of existing services is unchanged on upgrade
+            http_port = rgw_spec.get_http_port()
+            if http_port is not None:
+                frontend_parts.append(f'http_port={http_port}')
             allow_reuse = getattr(rgw_spec, 'allow_port_reuse', False)
             frontend_parts.append(f'allow_port_reuse={allow_reuse}')
             deps.append(f'frontend:{utils.config_hash(str(sorted(frontend_parts)))}')
+
+        # when metrics push is enabled, track pushgateway daemons and
+        # security config so RGW gets reconfigured when pushgateway is
+        # added/removed or its address/port changes.  We skip daemon
+        # status on purpose, a pushgateway restart shouldn't cause an
+        # RGW reconfig.  We also track which daemon is elected to run
+        # the timer so adding/removing daemons triggers a new pick.
+        if getattr(rgw_spec, 'metrics_push_enabled', False):
+            security_enabled, mgmt_gw_enabled, _ = mgr._get_security_config()
+            deps.append(f'security_enabled:{security_enabled}')
+            deps.append(f'metrics_push_interval:{rgw_spec.metrics_push_interval or 3600}')
+            deps.append(f'metrics_push_timeout:{rgw_spec.metrics_push_timeout or 300}')
+            deps.append(f'metrics_push_zone_name:{rgw_spec.rgw_zone or ""}')
+            for dd in mgr.cache.get_daemons_by_type('pushgateway'):
+                host = dd.ip or (
+                    mgr.inventory.get_addr(dd.hostname) if dd.hostname else ''
+                )
+                port = dd.ports[0] if dd.ports else 9091
+                deps.append(f'{dd.name()}:{host}:{port}')
+            deps.append(
+                f'mgmt_gw_enabled:{mgmt_gw_enabled}'
+            )
+            elected = cls._elected_metrics_push_daemon(mgr, rgw_spec)
+            if elected:
+                deps.append(f'metrics_push_elected:{elected}')
 
         return sorted(deps)
 
@@ -202,20 +233,39 @@ class RgwService(CephService):
 
         keyring = self.get_keyring(rgw_id)
 
+        # The HTTP port is chosen by role: RGWSpec.get_port() places it right
+        # after the primary port if (and only if) the spec has one with SSL
+        # enabled. Stored ports of a daemon deployed before the HTTP port was
+        # added to the spec may hold something else at index 1 (for example
+        # the port of an "ssl_port=" extra argument), so index 1 is never
+        # trusted: the HTTP port is derived from the spec using the daemon's
+        # offset from the spec's primary port (count_per_host).
+        spec_http = spec.get_http_port()
+        http_port: Optional[int] = None
         if daemon_spec.ports:
             port = daemon_spec.ports[0]
+            if spec_http is not None:
+                http_port = spec_http + (port - spec.get_port()[0])
+                if daemon_spec.ports[1:2] != [http_port]:
+                    # keep the remaining stored ports, but never twice
+                    daemon_spec.ports = [port, http_port] + [
+                        p for p in daemon_spec.ports[1:] if p != http_port
+                    ]
         else:
             # this is a redeploy of older instance that doesn't have an explicitly
             # assigned port, in which case we can assume there is only 1 per host
             # and it matches the spec.
             ports = spec.get_port()
-            if spec.ssl:
-                port = ports[1] if len(ports) > 1 else ports[0]
+            if spec_http is not None:
+                port, http_port = ports[0], ports[1]
+            elif spec.ssl:
+                # [plain port, ssl_port] only when rgw_frontend_port is set;
+                # otherwise the primary (default 443) comes first.
+                port = ports[1] if spec.rgw_frontend_port and len(ports) > 1 else ports[0]
             else:
                 port = ports[0]
 
         if spec.ssl:
-
             legacy_pem = spec.rgw_frontend_ssl_certificate
             if legacy_pem and not spec.ssl_cert:
                 if isinstance(legacy_pem, list):
@@ -260,6 +310,9 @@ class RgwService(CephService):
                 # back to 0.0.0.0 and can false-conflict with listeners on
                 # other addresses.
                 daemon_spec.port_ips.update({str(port): ip_to_bind_to})
+                if http_port is not None:
+                    daemon_spec.port_ips.update({str(http_port): ip_to_bind_to})
+
             else:
                 logger.warning(
                     f'Failed to find ip in {spec.networks} for host {daemon_spec.host}. '
@@ -270,14 +323,22 @@ class RgwService(CephService):
             # Same as only_bind_port_on_networks: keep precheck in sync with
             # the narrow endpoint=<ip>:<port> / port=<ip>:<port> bind below.
             daemon_spec.port_ips.update({str(port): ip_to_bind_to})
+            if http_port is not None:
+                daemon_spec.port_ips.update({str(http_port): ip_to_bind_to})
 
         if ftype == 'beast':
             if spec.ssl:
                 if ip_to_bind_to:
                     args.append(
                         f"ssl_endpoint={build_url(host=ip_to_bind_to, port=port).lstrip('/')}")
+                    if http_port is not None:
+                        args.append(
+                            f"endpoint={build_url(host=ip_to_bind_to, port=http_port).lstrip('/')}")
                 else:
                     args.append(f"ssl_port={port}")
+                    if http_port is not None:
+                        args.append(f"port={http_port}")
+
                 if spec.generate_cert:
                     args.append(f"ssl_certificate=config://rgw/cert/{daemon_spec.name()}")
                 elif not extra_ssl_cert_provided:
@@ -289,11 +350,16 @@ class RgwService(CephService):
                     args.append(f"port={port}")
         elif ftype == 'civetweb':
             if spec.ssl:
-                if ip_to_bind_to:
-                    # note the 's' suffix on port
-                    args.append(f"port={build_url(host=ip_to_bind_to, port=port).lstrip('/')}s")
-                else:
-                    args.append(f"port={port}s")  # note the 's' suffix on port
+                # civetweb takes a single port= option with '+' separated
+                # entries; note the 's' suffix on the SSL port
+                def _civet(p: int) -> str:
+                    if ip_to_bind_to:
+                        return build_url(host=ip_to_bind_to, port=p).lstrip('/')
+                    return str(p)
+                civet_ports = f"{_civet(port)}s"
+                if http_port is not None:
+                    civet_ports += f"+{_civet(http_port)}"
+                args.append(f"port={civet_ports}")
                 if spec.generate_cert:
                     args.append(f"ssl_certificate=config://rgw/cert/{daemon_spec.name()}")
                 elif not extra_ssl_cert_provided:
@@ -400,7 +466,90 @@ class RgwService(CephService):
                 'value': str(size),
             })
 
+        if spec.metrics_push_enabled:
+            elected = self._elected_metrics_push_daemon(self.mgr, spec)
+            pushgateway_url = self._get_pushgateway_url()
+            zone_name = spec.rgw_zone or ''
+            if elected and daemon_spec.name() == elected:
+                if pushgateway_url:
+                    metrics_push_config: Dict[str, Any] = {
+                        'pushgateway_url': pushgateway_url,
+                        'zone_name': zone_name,
+                        'interval': spec.metrics_push_interval or 3600,
+                        'timeout': spec.metrics_push_timeout or 300,
+                    }
+                    security_enabled, _, _ = self.mgr._get_security_config()
+                    if security_enabled:
+                        metrics_push_config['root_cert'] = self.mgr.cert_mgr.get_root_ca()
+                        self.mgr.cert_mgr.register_self_signed_cert_key_pair(
+                            spec.service_name(), 'metrics_push')
+                        tls_pair = self.get_self_signed_certificates_with_label(
+                            spec, daemon_spec, 'metrics_push')
+                        metrics_push_config['client_cert'] = tls_pair.cert
+                        metrics_push_config['client_key'] = tls_pair.key
+                    daemon_spec.final_config['metrics_push'] = metrics_push_config
+                else:
+                    logger.warning(
+                        f'{daemon_spec.name()}: metrics_push_enabled but no '
+                        'pushgateway daemon found, skipping timer setup'
+                    )
+            elif elected:
+                # This daemon is not the exporter. Give it the desired
+                # target so it can drop a group it pushed for a previous
+                # zone or pushgateway, and keep the group on a handoff.
+                if pushgateway_url:
+                    daemon_spec.final_config['metrics_push_target'] = {
+                        'pushgateway_url': pushgateway_url,
+                        'zone_name': zone_name,
+                    }
+                logger.debug(
+                    f'{daemon_spec.name()}: metrics push delegated to '
+                    f'{elected}, skipping timer for this daemon'
+                )
+        else:
+            # Feature is off. Ask the host to delete the last pushed
+            # group. A handoff does not land here: the feature stays on.
+            daemon_spec.final_config['metrics_push_cleanup'] = True
+
         return daemon_spec
+
+    @staticmethod
+    def _elected_metrics_push_daemon(
+        mgr: "CephadmOrchestrator",
+        spec: RGWSpec,
+    ) -> Optional[str]:
+        """Pick one daemon per service to run the metrics-push timer
+        so we don't end up with every daemon doing its own bucket stats
+        sweep.  We just sort by name and pick the first one; tracking
+        it in deps means a removal will trigger reconfig and a new pick.
+        """
+        daemons = sorted(
+            mgr.cache.get_daemons_by_service(spec.service_name()),
+            key=lambda d: d.name(),
+        )
+        return daemons[0].name() if daemons else None
+
+    def _get_pushgateway_url(self) -> str:
+        """Return the URL of a pushgateway daemon.
+
+        We ignore daemon status here on purpose, same as in
+        _get_service_dependencies.  Otherwise there's a race: if
+        pushgateway is still 'starting' at config time the URL comes
+        back empty, and since deps don't track status either, no
+        reconfig ever fires once it reaches 'running'.
+        """
+        daemons = sorted(
+            self.mgr.cache.get_daemons_by_type('pushgateway'),
+            key=lambda d: d.name(),
+        )
+        for dd in daemons:
+            if dd.hostname:
+                port = dd.ports[0] if dd.ports else 9091
+                host = dd.ip or self.mgr.inventory.get_addr(dd.hostname)
+                security_enabled, _, _ = self.mgr._get_security_config()
+                scheme = 'https' if security_enabled else 'http'
+                return build_url(scheme=scheme, host=host, port=port)
+        return ''
 
     def get_keyring(self, rgw_id: str) -> str:
         """
@@ -473,6 +622,18 @@ class RgwService(CephService):
             'key': f'rgw/cert/{daemon.name()}',
         })
 
+        # Clean up metrics_push labelled TLS credentials if no other
+        # daemons from this service remain on the host.
+        if daemon.hostname and daemon.service_name():
+            svc_name = daemon.service_name()
+            remaining = [
+                d for d in self.mgr.cache.get_daemons_by_service(svc_name)
+                if d.name() != daemon.name() and d.hostname == daemon.hostname
+            ]
+            if not remaining:
+                self.mgr.cert_mgr.try_rm_self_signed_cert_key_pair(
+                    svc_name, daemon.hostname, label='metrics_push')
+
     def ok_to_stop(
             self,
             daemon_ids: List[str],
@@ -532,35 +693,58 @@ class RgwService(CephService):
 
         return config, deps
 
+    def get_daemon_ports(self, daemon_name: str) -> set[int]:
+        """
+        Ports an RGW daemon listens on, parsed from its rgw_frontends config.
+        This includes the ports given in rgw_frontend_extra_args, not only the
+        ones cephadm deploys. Returns an empty set if the config can't be read.
+        """
+        who = f"client.{daemon_name}"
+        try:
+            ret, out, err = self.mgr.check_mon_command({
+                'prefix': 'config get',
+                'who': who,
+                'name': 'rgw_frontends'
+            })
+
+            if ret == 0 and out:
+                logger.debug(f"who: {who}, out: {out}")
+                return self._extract_ports_from_frontend(out.strip())
+        except Exception as e:
+            logger.warning(f"Failed to get the config details for {who}: {e}")
+        return set()
+
     def get_active_ports(self, service_name: str) -> List[int]:
         """
         Fetch active RGW frontend ports by parsing config entries for a given service.
         """
-        ports = set()
+        ports: set[int] = set()
         daemons = self.mgr.cache.get_daemons_by_service(service_name)
         for d in daemons:
-            who = f"client.{d.name()}"
-            try:
-                ret, out, err = self.mgr.check_mon_command({
-                    'prefix': 'config get',
-                    'who': who,
-                    'name': 'rgw_frontends'
-                })
-
-                if ret == 0 and out:
-                    logger.debug(f"who: {who}, out: {out}")
-                    ports.update(self._extract_ports_from_frontend(out.strip()))
-            except Exception as e:
-                logger.warning(f"Failed to get the config details for {who}: {e}")
-                continue
+            ports.update(self.get_daemon_ports(d.name()))
 
         return sorted(ports)
 
     def _extract_ports_from_frontend(self, frontend_str: str) -> set[int]:
+        # "port=" / "ssl_port=" may carry an address ("port=1.2.3.4:80"):
+        # skip it and capture only the port number.
+        ssl_port_match_patterns = [
+            r"(?:ssl_)?port=(?:\S*:)?(\d+)",
+            r"(?:ssl_)?endpoint=\S+:(\d+)",
+        ]
+        port_match_patterns = [
+            r"(?<!ssl_)port=(?:\S*:)?(\d+)",
+            r"(?<!ssl_)endpoint=\S+:(\d+)",
+        ]
 
         ports = set()
-        for val in frontend_str.split():
-            if val.startswith("port="):
-                ports.add(int(val.split("=")[1]))
+
+        for pattern in ssl_port_match_patterns:
+            for port_str in re.findall(pattern, frontend_str):
+                ports.add(int(port_str))
+
+        for pattern in port_match_patterns:
+            for port_str in re.findall(pattern, frontend_str):
+                ports.add(int(port_str))
 
         return ports

@@ -1,6 +1,5 @@
-
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import call, patch, MagicMock
 
 from orchestrator import OrchestratorError
 
@@ -56,6 +55,147 @@ class TestRGWService:
                     'key': 'rgw_frontends',
                 })
                 assert f == expected
+
+    @pytest.mark.parametrize(
+        "frontend, extra_args, expected",
+        [
+            ('beast', None,
+             'beast ssl_port=443 port=8080 ssl_certificate=config://rgw/cert/rgw.foo'),
+            # an ssl_port in extra args must not be mistaken for the secondary port
+            ('beast', ['ssl_port=8443'],
+             'beast ssl_port=443 port=8080 ssl_certificate=config://rgw/cert/rgw.foo ssl_port=8443'),
+            ('beast', ['tcp_nodelay=1', 'port=8081'],
+             'beast ssl_port=443 port=8080 ssl_certificate=config://rgw/cert/rgw.foo tcp_nodelay=1 port=8081'),
+            ('civetweb', None,
+             'civetweb port=443s+8080 ssl_certificate=config://rgw/cert/rgw.foo'),
+        ]
+    )
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    def test_rgw_http_port_frontend(self, frontend, extra_args, expected,
+                                    cephadm_module: CephadmOrchestrator):
+        with with_host(cephadm_module, 'host1'):
+            extra = list(extra_args) if extra_args else None
+            s = RGWSpec(service_id="foo",
+                        ssl=True,
+                        rgw_frontend_type=frontend,
+                        rgw_frontend_port=443,
+                        rgw_frontend_http_port=8080,
+                        rgw_frontend_extra_args=extra)
+            with with_service(cephadm_module, s) as dds:
+                _, f, _ = cephadm_module.check_mon_command({
+                    'prefix': 'config get',
+                    'who': f'client.{dds[0]}',
+                    'key': 'rgw_frontends',
+                })
+                assert f == expected
+                # the spec's extra args are never rewritten
+                assert s.rgw_frontend_extra_args == extra
+
+    @pytest.mark.parametrize(
+        "frontend, extra_args, expected",
+        [
+            ('beast', ['tcp_nodelay=1', 'max_header_size=65536', 'ssl_port=8443'],
+             'beast ssl_port=443 ssl_certificate=config://rgw/cert/rgw.foo '
+             'tcp_nodelay=1 max_header_size=65536 ssl_port=8443'),
+        ]
+    )
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    def test_rgw_extra_ssl_port_keeps_default_primary_port(
+            self, frontend, extra_args, expected, cephadm_module: CephadmOrchestrator):
+        # without rgw_frontend_port, SSL keeps listening on the default 443
+        # and an "ssl_port=" extra argument is an additional port
+        with with_host(cephadm_module, 'host1'):
+            s = RGWSpec(service_id="foo",
+                        ssl=True,
+                        rgw_frontend_type=frontend,
+                        rgw_frontend_extra_args=list(extra_args))
+            with with_service(cephadm_module, s) as dds:
+                _, f, _ = cephadm_module.check_mon_command({
+                    'prefix': 'config get',
+                    'who': f'client.{dds[0]}',
+                    'key': 'rgw_frontends',
+                })
+                assert f == expected
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    def test_rgw_http_port_ips_with_explicit_ip(self, cephadm_module: CephadmOrchestrator):
+        ip = '1.2.3.4'
+        with with_host(cephadm_module, 'host1'):
+            s = RGWSpec(
+                service_id='foo',
+                placement=PlacementSpec(hosts=['host1']),
+                ssl=True,
+                rgw_frontend_type='beast',
+                rgw_frontend_port=443,
+                rgw_frontend_http_port=8080,
+            )
+            with with_service(cephadm_module, s) as _:
+                daemon_spec = service_registry.get_service('rgw').prepare_create(
+                    DaemonDeployContext(CephadmDaemonDeploySpec(
+                        host='host1',
+                        daemon_type='rgw',
+                        daemon_id='foo.host1.0',
+                        service_name=s.service_name(),
+                        ports=[443, 8080],
+                        ip=ip,
+                    )))
+                assert daemon_spec.port_ips == {'443': ip, '8080': ip}
+
+    @pytest.mark.parametrize(
+        "stored_ports, expected_ports, expected_frontend",
+        [
+            # deployed before the HTTP port existed: ssl_port=8443 sits at index 1
+            ([443, 8443], [443, 8080, 8443],
+             'beast ssl_port=443 port=8080 ssl_certificate=config://rgw/cert/rgw.foo '
+             'ssl_port=8443'),
+            # only the primary port was stored
+            ([443], [443, 8080],
+             'beast ssl_port=443 port=8080 ssl_certificate=config://rgw/cert/rgw.foo '
+             'ssl_port=8443'),
+            # second daemon on the host (count_per_host): same offset for every port
+            ([444, 8444], [444, 8081, 8444],
+             'beast ssl_port=444 port=8081 ssl_certificate=config://rgw/cert/rgw.foo '
+             'ssl_port=8443'),
+            # already deployed with the HTTP port: nothing changes
+            ([443, 8080, 8443], [443, 8080, 8443],
+             'beast ssl_port=443 port=8080 ssl_certificate=config://rgw/cert/rgw.foo '
+             'ssl_port=8443'),
+        ]
+    )
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    def test_rgw_http_port_added_to_a_running_service(
+            self, stored_ports, expected_ports, expected_frontend,
+            cephadm_module: CephadmOrchestrator):
+        # The service was running with ssl: true and ssl_port=8443 in the
+        # extra args; rgw_frontend_http_port: 8080 is added to the spec. The
+        # stored ports must not make 8443 the HTTP port.
+        with with_host(cephadm_module, 'host1'):
+            s = RGWSpec(
+                service_id='foo',
+                placement=PlacementSpec(hosts=['host1']),
+                ssl=True,
+                rgw_frontend_type='beast',
+                rgw_frontend_port=443,
+                rgw_frontend_http_port=8080,
+                rgw_frontend_extra_args=['ssl_port=8443'],
+            )
+            with with_service(cephadm_module, s) as _:
+                daemon_spec = service_registry.get_service('rgw').prepare_create(
+                    DaemonDeployContext(CephadmDaemonDeploySpec(
+                        host='host1',
+                        daemon_type='rgw',
+                        daemon_id='foo.host1.0',
+                        service_name=s.service_name(),
+                        ports=list(stored_ports),
+                    )))
+                assert daemon_spec.ports == expected_ports
+                assert len(set(daemon_spec.ports)) == len(daemon_spec.ports)
+                _, f, _ = cephadm_module.check_mon_command({
+                    'prefix': 'config get',
+                    'who': f'client.{daemon_spec.name()}',
+                    'key': 'rgw_frontends',
+                })
+                assert f == expected_frontend
 
     @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
     def test_rgw_port_ips_with_explicit_ip(self, cephadm_module: CephadmOrchestrator):
@@ -580,7 +720,10 @@ class TestRGWService:
                 with patch.object(cm, "try_rm_self_signed_cert_key_pair",
                                   wraps=cm.try_rm_self_signed_cert_key_pair) as rm_mock:
                     rgw_svc.post_remove(daemon, is_failed_deploy=False)
-                    rm_mock.assert_called_once_with(svc_name, host)
+                    rm_mock.assert_has_calls([
+                        call(svc_name, host),
+                        call(svc_name, host, label='metrics_push'),
+                    ])
 
                 # Assert cephadm-signed leftovers are gone
                 assert cm.get_cert(cert_name, host=host) is None
@@ -744,6 +887,256 @@ class TestRGWService:
                             'custom_sans': ['s3.example.com', '*.s3.example.com'],
                         }
 
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    def test_rgw_count_per_host_two_daemons_one_uses_defined_ports_other_has_different_ports(
+            self, cephadm_module: CephadmOrchestrator):
+        """
+        Create an RGW service with count_per_host = 2 and explicit
+        rgw_frontend_port / rgw_frontend_http_port. Assert one daemon
+        exposes the configured ports and the other daemon uses distinct ports.
+        """
+        # explicit ports we want the "primary" daemon to use
+        primary_port = 443
+        http_port = 8080
+
+        spec = RGWSpec(
+            service_id="default",
+            placement=PlacementSpec(count_per_host=2, hosts=['host1']),
+            rgw_frontend_type='beast',
+            rgw_frontend_port=primary_port,
+            rgw_frontend_http_port=http_port,
+            ssl=True,
+        )
+
+        with with_host(cephadm_module, 'host1'):
+            with with_service(cephadm_module, spec) as deployed_daemons:
+                # fetch the actual daemon descriptions (they contain ports)
+                dds = cephadm_module.cache.get_daemons_by_service(spec.service_name())
+                # Sanity check: two daemons expected
+                assert len(deployed_daemons) == 2, f"expected 2 daemons, got: {deployed_daemons!r}"
+
+                # convert to sets of ports (defensive for None)
+                daemon_ports = [set(dd.ports or []) for dd in dds]
+
+                # Ensure at least one daemon advertises the configured primary ports
+                found_primary = any({primary_port, http_port}.issubset(p) for p in daemon_ports)
+                assert found_primary, (
+                    f"None of the deployed daemons advertise both configured ports "
+                    f"{primary_port},{http_port}. extracted: {daemon_ports}"
+                )
+
+                # Identify which daemon has the primary ports
+                primary_idx = next(i for i, p in enumerate(daemon_ports)
+                                   if {primary_port, http_port}.issubset(p))
+                other_idx = 1 - primary_idx
+
+                # Ensure the other daemon does not reuse those ports
+                assert ({primary_port, http_port} & daemon_ports[other_idx]) == set(), (
+                    f"Port collision: other daemon shares primary ports: "
+                    f"{daemon_ports[other_idx]} & {{{primary_port},{http_port}}}"
+                )
+
+                # Ensure the two daemons don't share any port at all
+                assert daemon_ports[0].isdisjoint(daemon_ports[1]), (
+                    f"Daemons share ports (collision): {daemon_ports[0] & daemon_ports[1]}"
+                )
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    @patch("cephadm.services.rgw.RgwService._get_pushgateway_url",
+           return_value='http://host1:9091')
+    @patch("cephadm.services.rgw.RgwService._elected_metrics_push_daemon",
+           return_value='rgw.foo.host1.0')
+    def test_rgw_metrics_push_config(self, _mock_elected, _mock_pg_url,
+                                     cephadm_module: CephadmOrchestrator):
+        """Verify that metrics_push config is included in final_config
+        when metrics_push_enabled is True and a pushgateway daemon exists."""
+        with with_host(cephadm_module, 'host1'):
+            s = RGWSpec(service_id='foo',
+                        rgw_realm='realm',
+                        rgw_zone='zone',
+                        metrics_push_enabled=True,
+                        metrics_push_interval=1800,
+                        metrics_push_timeout=120)
+            with with_service(cephadm_module, s):
+                svc = service_registry.get_service('rgw')
+                daemon_spec = svc.prepare_create(
+                    DaemonDeployContext(CephadmDaemonDeploySpec(
+                        host='host1',
+                        daemon_type='rgw',
+                        daemon_id='foo.host1.0',
+                        service_name=s.service_name(),
+                        ports=[80],
+                        ip=None,
+                    )))
+                mp = daemon_spec.final_config.get('metrics_push')
+                assert mp is not None, "metrics_push config should be present"
+                assert mp['interval'] == 1800
+                assert mp['timeout'] == 120
+                assert mp['zone_name'] == 'zone'
+                assert mp['pushgateway_url'] == 'http://host1:9091'
+                assert daemon_spec.final_config.get('metrics_push_cleanup') is None
+                assert daemon_spec.final_config.get('metrics_push_target') is None
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    @patch("cephadm.services.rgw.RgwService._get_pushgateway_url",
+           return_value='')
+    @patch("cephadm.services.rgw.RgwService._elected_metrics_push_daemon",
+           return_value='rgw.foo.host1.0')
+    def test_rgw_metrics_push_no_pushgateway(self, _mock_elected, _mock_pg_url,
+                                             cephadm_module: CephadmOrchestrator):
+        """When no pushgateway daemon exists, metrics_push should not appear in final_config."""
+        with with_host(cephadm_module, 'host1'):
+            s = RGWSpec(service_id='foo',
+                        rgw_realm='realm',
+                        rgw_zone='zone',
+                        metrics_push_enabled=True)
+            with with_service(cephadm_module, s):
+                svc = service_registry.get_service('rgw')
+                daemon_spec = svc.prepare_create(
+                    DaemonDeployContext(CephadmDaemonDeploySpec(
+                        host='host1',
+                        daemon_type='rgw',
+                        daemon_id='foo.host1.0',
+                        service_name=s.service_name(),
+                        ports=[80],
+                        ip=None,
+                    )))
+                mp = daemon_spec.final_config.get('metrics_push')
+                assert mp is None, "metrics_push should not be set without pushgateway"
+                assert daemon_spec.final_config.get('metrics_push_target') is None
+                assert daemon_spec.final_config.get('metrics_push_cleanup') is None
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    @patch("cephadm.services.rgw.RgwService._get_pushgateway_url",
+           return_value='http://host1:9091')
+    def test_rgw_metrics_push_election_only_elected_gets_config(
+        self, _mock_pg_url, cephadm_module: CephadmOrchestrator
+    ):
+        """With multiple daemons, only the first sorted by name should get
+        the metrics_push config.  The rest should have no metrics_push."""
+        with with_host(cephadm_module, 'host1'):
+            s = RGWSpec(service_id='foo',
+                        rgw_realm='realm',
+                        rgw_zone='zone',
+                        metrics_push_enabled=True,
+                        placement=PlacementSpec(count=2))
+            with with_service(cephadm_module, s):
+                d1 = MagicMock()
+                d1.name.return_value = 'rgw.foo.host1.aaa'
+                d2 = MagicMock()
+                d2.name.return_value = 'rgw.foo.host1.zzz'
+
+                svc = service_registry.get_service('rgw')
+
+                with patch.object(cephadm_module.cache,
+                                  'get_daemons_by_service',
+                                  return_value=[d2, d1]):
+                    elected_spec = svc.prepare_create(
+                        DaemonDeployContext(CephadmDaemonDeploySpec(
+                            host='host1',
+                            daemon_type='rgw',
+                            daemon_id='foo.host1.aaa',
+                            service_name=s.service_name(),
+                            ports=[80],
+                            ip=None,
+                        )))
+                    mp_elected = elected_spec.final_config.get('metrics_push')
+                    assert mp_elected is not None, \
+                        "elected daemon should get metrics_push config"
+                    assert mp_elected['pushgateway_url'] == 'http://host1:9091'
+
+                    other_spec = svc.prepare_create(
+                        DaemonDeployContext(CephadmDaemonDeploySpec(
+                            host='host1',
+                            daemon_type='rgw',
+                            daemon_id='foo.host1.zzz',
+                            service_name=s.service_name(),
+                            ports=[80],
+                            ip=None,
+                        )))
+                    mp_other = other_spec.final_config.get('metrics_push')
+                    assert mp_other is None, \
+                        "non-elected daemon should NOT get metrics_push config"
+                    assert other_spec.final_config.get('metrics_push_target') == {
+                        'pushgateway_url': 'http://host1:9091',
+                        'zone_name': 'zone',
+                    }
+                    assert not other_spec.final_config.get('metrics_push_cleanup')
+                    assert not elected_spec.final_config.get('metrics_push_target')
+                    assert not elected_spec.final_config.get('metrics_push_cleanup')
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    def test_rgw_metrics_push_disabled_requests_cleanup(
+        self, cephadm_module: CephadmOrchestrator
+    ):
+        """Disabling the feature asks the host to delete the last group."""
+        with with_host(cephadm_module, 'host1'):
+            s = RGWSpec(service_id='foo',
+                        rgw_realm='realm',
+                        rgw_zone='zone',
+                        metrics_push_enabled=False)
+            with with_service(cephadm_module, s):
+                svc = service_registry.get_service('rgw')
+                daemon_spec = svc.prepare_create(
+                    DaemonDeployContext(CephadmDaemonDeploySpec(
+                        host='host1',
+                        daemon_type='rgw',
+                        daemon_id='foo.host1.0',
+                        service_name=s.service_name(),
+                        ports=[80],
+                        ip=None,
+                    )))
+                assert daemon_spec.final_config.get('metrics_push') is None
+                assert daemon_spec.final_config.get('metrics_push_target') is None
+                assert daemon_spec.final_config.get('metrics_push_cleanup') is True
+
+
+def test_rgw_metrics_push_elected_name_in_deps():
+    """The elected daemon name should appear in deps so that adding or
+    removing a daemon triggers a reconfig."""
+    spec = RGWSpec(service_id='foo',
+                   metrics_push_enabled=True,
+                   metrics_push_interval=3600)
+
+    d1 = MagicMock()
+    d1.name.return_value = 'rgw.foo.host1.aaa'
+    d2 = MagicMock()
+    d2.name.return_value = 'rgw.foo.host1.zzz'
+
+    mgr = MagicMock()
+    mgr._get_security_config.return_value = (False, False, None)
+    mgr.cache.get_daemons_by_type.return_value = []  # no pushgateway
+    mgr.cache.get_daemons_by_service.return_value = [d2, d1]
+
+    deps = RgwService.get_dependencies(mgr, spec, 'rgw')
+    elected_deps = [d for d in deps if d.startswith('metrics_push_elected:')]
+    assert len(elected_deps) == 1
+    assert elected_deps[0] == 'metrics_push_elected:rgw.foo.host1.aaa'
+
+
+def test_rgw_metrics_push_pushgateway_starting_still_yields_url():
+    """A pushgateway in 'starting' state should still produce a URL.
+    We ignore status on purpose to avoid the race where the timer
+    is never installed."""
+    from orchestrator import DaemonDescriptionStatus
+
+    pg_daemon = MagicMock()
+    pg_daemon.name.return_value = 'pushgateway.host1.abc'
+    pg_daemon.hostname = 'host1'
+    pg_daemon.ip = '10.0.0.1'
+    pg_daemon.ports = [9091]
+    pg_daemon.status = DaemonDescriptionStatus.starting
+
+    mgr = MagicMock()
+    mgr.cache.get_daemons_by_type.return_value = [pg_daemon]
+    mgr._get_security_config.return_value = (False, False, None)
+
+    svc = RgwService.__new__(RgwService)
+    svc.mgr = mgr
+
+    url = svc._get_pushgateway_url()
+    assert url == 'http://10.0.0.1:9091'
+
 
 def test_rgw_dependencies_include_legacy_frontend_certificate_hash():
     from cephadm import utils
@@ -798,3 +1191,107 @@ def test_rgw_deps_stable_with_reordered_extra_args():
     deps_a = RgwService.get_dependencies(MagicMock(), spec_a)
     deps_b = RgwService.get_dependencies(MagicMock(), spec_b)
     assert deps_a == deps_b
+
+
+def test_rgw_deps_unchanged_without_http_port():
+    # the frontend dep of services that do not use the new field must not move
+    spec = RGWSpec(service_id="foo", rgw_frontend_port=8300,
+                   rgw_frontend_extra_args=['port=8080+8443s'])
+    assert not any('http_port' in d for d in RgwService.get_dependencies(MagicMock(), spec))
+
+
+def test_rgw_deps_change_with_http_port():
+    base = dict(service_id="foo", ssl=True, rgw_frontend_port=443)
+    deps_a = RgwService.get_dependencies(MagicMock(), RGWSpec(**base))
+    deps_b = RgwService.get_dependencies(
+        MagicMock(), RGWSpec(rgw_frontend_http_port=8080, **base))
+    assert deps_a != deps_b
+
+
+@pytest.mark.parametrize("frontend, expected", [
+    ('beast port=8080', {8080}),
+    ('beast ssl_port=443 port=8080 ssl_certificate=config://x', {443, 8080}),
+    ('beast ssl_endpoint=10.0.0.1:443 endpoint=10.0.0.1:8080 tcp_nodelay=1 '
+     'port=192.168.104.100:8081 ssl_port=192.168.104.100:444', {443, 8080, 8081, 444}),
+    ('beast port=[fd00::1]:8081 ssl_port=[fd00::1]:444', {8081, 444}),
+    ('civetweb port=8080+8443s', {8080}),
+])
+def test_rgw_extract_ports_from_frontend(frontend, expected):
+    assert RgwService._extract_ports_from_frontend(MagicMock(), frontend) == expected
+
+
+def test_rgw_get_daemon_ports():
+    mgr = MagicMock()
+    mgr.check_mon_command.return_value = (
+        0, 'beast ssl_port=443 port=445 ssl_port=192.168.100.100:444 port=8081 ', '')
+    assert RgwService(mgr).get_daemon_ports('rgw.foo.host1.abc') == {443, 444, 445, 8081}
+    mgr.check_mon_command.assert_called_once_with({
+        'prefix': 'config get',
+        'who': 'client.rgw.foo.host1.abc',
+        'name': 'rgw_frontends',
+    })
+
+
+@pytest.mark.parametrize("result", [(0, '', ''), (1, 'beast port=8080', 'ENOENT')])
+def test_rgw_get_daemon_ports_without_usable_config(result):
+    mgr = MagicMock()
+    mgr.check_mon_command.return_value = result
+    assert RgwService(mgr).get_daemon_ports('rgw.foo.host1.abc') == set()
+
+
+def test_rgw_get_daemon_ports_never_raises():
+    mgr = MagicMock()
+    mgr.check_mon_command.side_effect = Exception('boom')
+    assert RgwService(mgr).get_daemon_ports('rgw.foo.host1.abc') == set()
+
+
+def test_rgw_get_active_ports_is_the_union_of_the_daemon_ports():
+    mgr = MagicMock()
+    d1, d2 = MagicMock(), MagicMock()
+    d1.name.return_value = 'rgw.foo.host1.a'
+    d2.name.return_value = 'rgw.foo.host2.b'
+    mgr.cache.get_daemons_by_service.return_value = [d1, d2]
+    frontends = {
+        'client.rgw.foo.host1.a': 'beast ssl_port=443 port=445 port=8081',
+        'client.rgw.foo.host2.b': 'beast ssl_port=443 port=445 port=8082',
+    }
+    mgr.check_mon_command.side_effect = lambda cmd: (0, frontends[cmd['who']], '')
+    assert RgwService(mgr).get_active_ports('rgw.foo') == [443, 445, 8081, 8082]
+
+
+class TestRGWListDaemonsPorts:
+    @staticmethod
+    def _deployed_ports(cephadm_module: CephadmOrchestrator):
+        # ports cephadm itself deployed, straight from the cache
+        return {d.name(): list(d.ports or [])
+                for d in cephadm_module.cache.get_daemons_by_service('rgw.foo')}
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    def test_orch_ps_shows_the_ports_of_orch_ls(self, cephadm_module: CephadmOrchestrator):
+        with with_host(cephadm_module, 'host1'):
+            s = RGWSpec(service_id="foo", ssl=True, rgw_frontend_port=443)
+            with with_service(cephadm_module, s):
+                deployed = self._deployed_ports(cephadm_module)
+                assert deployed
+                ports = {443, 444, 8081}
+                with patch.object(RgwService, 'get_daemon_ports', return_value=ports):
+                    daemons = cephadm_module.list_daemons(daemon_type='rgw').result
+                assert sorted(d.name() for d in daemons) == sorted(deployed)
+                for d in daemons:
+                    assert d.ports == sorted(set(deployed[d.name()]) | ports)
+                    assert {443, 444, 8081} <= set(d.ports)
+                    assert d.get_port_summary().endswith(',8081')
+                # the cache is not altered by what `ceph orch ps` shows
+                assert self._deployed_ports(cephadm_module) == deployed
+
+    @patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    def test_orch_ps_keeps_the_deployed_ports_without_frontend_config(
+            self, cephadm_module: CephadmOrchestrator):
+        with with_host(cephadm_module, 'host1'):
+            s = RGWSpec(service_id="foo", ssl=True, rgw_frontend_port=443)
+            with with_service(cephadm_module, s):
+                deployed = self._deployed_ports(cephadm_module)
+                assert deployed
+                with patch.object(RgwService, 'get_daemon_ports', return_value=set()):
+                    daemons = cephadm_module.list_daemons(daemon_type='rgw').result
+                assert {d.name(): d.ports for d in daemons} == deployed

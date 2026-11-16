@@ -397,9 +397,11 @@ public:
 				      const std::map<std::string,
 				      std::string>& meta) override;
   virtual void get_quota(RGWQuota& quota) override;
-  virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit,
-			     RGWRateLimitInfo& user_ratelimit,
-			     RGWRateLimitInfo& anon_ratelimit) override;
+  virtual void get_ratelimit(
+      RGWRateLimitInfo& bucket_ratelimit,
+      RGWRateLimitInfo& user_ratelimit,
+      RGWRateLimitInfo& account_ratelimit,
+      RGWRateLimitInfo& anon_ratelimit) override;
   virtual int set_buckets_enabled(const DoutPrefixProvider* dpp,
 				  std::vector<rgw_bucket>& buckets,
 				  bool enabled, optional_yield y) override;
@@ -795,6 +797,7 @@ public:
                const ceph::real_time* mod_ptr, const ceph::real_time* unmod_ptr,
                bool high_precision_time,
                const char* if_match, const char* if_nomatch,
+               const char* dest_if_match, const char* dest_if_nomatch,
                AttrsMod attrs_mod, bool copy_if_newer, Attrs& attrs,
                RGWObjCategory category, uint64_t olh_epoch,
 	       boost::optional<ceph::real_time> delete_at,

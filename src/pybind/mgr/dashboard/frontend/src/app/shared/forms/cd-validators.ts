@@ -62,6 +62,18 @@ export class CdValidators {
     }
   }
 
+  static ipv4Cidr(): ValidatorFn {
+    // prettier-ignore
+    const cidrRgx =
+      /^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\/(([0-9]|[12][0-9]|3[0-2]))$/;
+    return (control: AbstractControl): ValidationErrors | null => {
+      if (!control.value) {
+        return null;
+      }
+      return cidrRgx.test(control.value) ? null : { pattern: true };
+    };
+  }
+
   /**
    * Validator function in order to validate numbers.
    * @returns {ValidatorFn} A validator function that returns an error map containing `pattern`
@@ -434,6 +446,61 @@ export class CdValidators {
           _.unset(errors, 'match');
           ctrl2.setErrors(_.isEmpty(_.keys(errors)) ? null : errors);
         }
+      }
+      return null;
+    };
+  }
+
+  /**
+   * Validator factory that requires the two specified controls to have
+   * different values. This is the inverse of `match`.
+   * Errors will be added directly to the `path2` control instead of the parent group.
+   * @param {string} path1 A dot-delimited string that defines the path to the first control.
+   * @param {string} path2 A dot-delimited string that defines the path to the second control.
+   * @param {Function} [enabled] Optional predicate receiving the group. When it returns
+   *   false the check is skipped and a stale `doNotMatch` error is cleared.
+   * @param {number} [defaultValue1] default value used when path1 control is empty.
+   * @return {ValidatorFn} Returns an Angular ValidatorFn. The function itself evaluates to `null`
+   * for the target control group, while setting or clearing the `doNotMatch` error map on `path2`.
+   */
+  static doNotMatch(
+    path1: string,
+    path2: string,
+    enabled?: (group: AbstractControl) => boolean,
+    defaultValue1?: number
+  ): ValidatorFn {
+    return (control: AbstractControl): { [key: string]: any } | null => {
+      const ctrl1 = control.get(path1);
+      const ctrl2 = control.get(path2);
+      if (!ctrl1 || !ctrl2) {
+        return null;
+      }
+
+      const clearDoNotMatchError = () => {
+        if (ctrl2.hasError('doNotMatch')) {
+          // Remove the 'doNotMatch' error. If no more errors exist, then set
+          // the error value to 'null', otherwise the field is still marked
+          // as invalid.
+          const errors = ctrl2.errors;
+          _.unset(errors, 'doNotMatch');
+          ctrl2.setErrors(_.isEmpty(_.keys(errors)) ? null : errors);
+        }
+      };
+      const value1 = isEmptyInputValue(ctrl1.value) ? defaultValue1 : ctrl1.value;
+
+      if (
+        (enabled && !enabled(control)) ||
+        isEmptyInputValue(value1) ||
+        isEmptyInputValue(ctrl2.value)
+      ) {
+        clearDoNotMatchError();
+        return null;
+      }
+
+      if (Number(value1) === Number(ctrl2.value)) {
+        ctrl2.setErrors({ ...ctrl2.errors, doNotMatch: true });
+      } else {
+        clearDoNotMatchError();
       }
       return null;
     };

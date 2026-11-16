@@ -5,7 +5,9 @@
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
+#include <netdb.h>
 
+#include <cerrno>
 #include <vector>
 #include <string>
 #include <array>
@@ -23,6 +25,7 @@
 
 
 #include "ceph_ver.h"
+#include "common/errno.h"
 #include "common/Formatter.h"
 #include "common/utf8.h"
 #include "common/ceph_json.h"
@@ -33,6 +36,7 @@
 #include "rgw_auth_registry.h"
 #include "jwt-cpp/jwt.h"
 #include "rgw_rest_sts.h"
+#include "rgw_sts_jwks.h"
 
 #include "rgw_formats.h"
 #include "rgw_client_io.h"
@@ -44,6 +48,7 @@
 
 #include "rgw_sts.h"
 #include "rgw_rest_oidc_provider.h"
+#include "rgw_url.h"
 #include "rgw_asio_thread.h"
 
 
@@ -352,63 +357,37 @@ WebTokenEngine::get_cert_url(const string& iss, const DoutPrefixProvider *dpp, o
   return cert_url;
 }
 
-std::string
-WebTokenEngine::get_top_level_domain_from_host(const DoutPrefixProvider* dpp, const std::string& hostname) const
-{
-  std::string host = hostname;
-  //get top level domain only, removing https etc
-  auto pos = host.find("http://");
-  if (pos == std::string::npos) {
-    pos = host.find("https://");
-    if (pos != std::string::npos) {
-      host.erase(pos, 8);
-    } else {
-      pos = host.find("www.");
-      if (pos != std::string::npos) {
-        host.erase(pos, 4);
-      }
-    }
-  } else {
-    host.erase(pos, 7);
-  }
-
-  pos = host.find("/");
-  if (pos != std::string::npos) {
-    host.erase(pos, (host.length() - 1));
-  }
-
-  ldpp_dout(dpp, 20) << "Top level domain name of the host is: " << host << dendl;
-  return host;
-}
-
 int
 WebTokenEngine::create_connection(const DoutPrefixProvider* dpp, const std::string& hostname, int port) const
 {
-  struct hostent* host = gethostbyname(hostname.c_str());
-  if (!host) {
-    ldpp_dout(dpp, 0) << "gethostbyname failed for host: " << hostname << dendl;
-    return -1;
-  }
-
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  memcpy(&addr.sin_addr, host->h_addr, host->h_length);
-
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (sock < 0) {
-    ldpp_dout(dpp, 10) << "creation of socket failed: " << sock << dendl;
-    return -1;
-  }
-
-  int ret = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+  struct addrinfo hints = {};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* addrs = nullptr;
+  const auto service = std::to_string(port);
+  int ret = getaddrinfo(hostname.c_str(), service.c_str(), &hints, &addrs);
   if (ret != 0) {
-    ldpp_dout(dpp, 10) << "connection to socket failed: " << ret << dendl;
-    close(sock);
+    ldpp_dout(dpp, 0) << "getaddrinfo failed for host: " << hostname
+                    << ": " << gai_strerror(ret) << dendl;
     return -1;
   }
 
+  int sock = -1;
+  for (auto ai = addrs; ai != nullptr; ai = ai->ai_next) {
+    sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (sock < 0) {
+      ldpp_dout(dpp, 10) << "creation of socket failed: " << sock << dendl;
+      continue;
+    }
+    if (connect(sock, ai->ai_addr, ai->ai_addrlen) == 0) {
+      break;
+    }
+    ldpp_dout(dpp, 10) << "connection to " << hostname << ":" << port
+                      << " failed: " << cpp_strerror(errno) << dendl;
+    close(sock);
+    sock = -1;
+  }
+  freeaddrinfo(addrs);
   return sock;
 }
 
@@ -606,9 +585,14 @@ bool WebTokenEngine::verify_oidc_thumbprint(const DoutPrefixProvider* dpp, const
   }
 
   // Fetch and verify cert according to https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc_verify-thumbprint.html
-  const auto hostname = get_top_level_domain_from_host(dpp, cert_url);
-  ldpp_dout(dpp, 20) << "Validating hostname: " << hostname << dendl;
-  const auto cert_chain = connect_to_host_get_cert_chain(dpp, hostname, 443);
+  std::string hostname;
+  uint16_t port = 0;
+  if (!rgw::parse_url_host_port(cert_url, hostname, port, 443)) {
+    ldpp_dout(dpp, 5) << "Failed to parse JWKS url: " << cert_url << dendl;
+    return false;
+  }
+  ldpp_dout(dpp, 20) << "Validating hostname: " << hostname << " port: " << port << dendl;
+  const auto cert_chain = connect_to_host_get_cert_chain(dpp, hostname, port);
   std::string cert;
   try {
     cert = extract_last_certificate(dpp, cert_chain);
@@ -653,12 +637,16 @@ WebTokenEngine::validate_signature(const DoutPrefixProvider* dpp, const jwt::dec
     if (parser.parse(cert_resp.c_str(), cert_resp.length())) {
       JSONObj* val = parser.find_obj("keys");
       if (val && val->is_array()) {
-        vector<string> keys = val->get_array_elements();
+        std::optional<std::string> token_kid;
+        if (decoded.has_key_id()) {
+          token_kid = decoded.get_key_id();
+        }
+        auto keys = detail::select_jwks_keys(*val, token_kid);
         for (auto &key : keys) {
-          JSONParser k_parser;
+          JSONObj& k_parser = *key;
           vector<string> x5c;
           std::string use, kid;
-          if (k_parser.parse(key.c_str(), key.size())) {
+          if (k_parser.is_object()) {
             if (JSONDecoder::decode_json("kid", kid, &k_parser)) {
               ldpp_dout(dpp, 20) << "Checking key id: " << kid << dendl;
             }
@@ -771,7 +759,7 @@ WebTokenEngine::validate_signature(const DoutPrefixProvider* dpp, const jwt::dec
                 ldpp_dout(dpp, 10) << "Bare key parameters (n&e) are not present for key" << dendl;
               }
             }
-          } //end k_parser.parse
+          } //end k_parser.is_object
         } //end for iterate through keys
         ldpp_dout(dpp, 0) << "Signature can not be validated with the JWKS present." << dendl;
         throw std::system_error(EINVAL, std::system_category());
@@ -1011,7 +999,7 @@ int RGWSTSAssumeRoleWithWebIdentity::verify_permission(optional_yield y)
                                       op, *arn, boost::none, owner, p,
                                       s->iam_identity_policies,
                                       s->session_policies)) {
-        ldout(s->cct, 0) << "evaluating policy for stsTagSession returned deny/pass" << dendl;
+        ldpp_dout(this, 0) << "evaluating policy for stsTagSession returned deny/pass" << dendl;
         return -EPERM;
       }
     }
@@ -1020,7 +1008,7 @@ int RGWSTSAssumeRoleWithWebIdentity::verify_permission(optional_yield y)
                                     op, *arn, boost::none, owner, p,
                                     s->iam_identity_policies,
                                     s->session_policies)) {
-      ldout(s->cct, 0) << "evaluating policy for op: " << op << " returned deny/pass" << dendl;
+      ldpp_dout(this, 0) << "evaluating policy for op: " << op << " returned deny/pass" << dendl;
       return -EPERM;
     }
   } catch (rgw::IAM::PolicyParseException& e) {
@@ -1148,7 +1136,7 @@ int RGWSTSAssumeRole::verify_permission(optional_yield y)
                                       op, *arn, boost::none, owner, p,
                                       s->iam_identity_policies,
                                       s->session_policies)) {
-        ldout(s->cct, 0) << "evaluating policy for stsTagSession returned deny/pass" << dendl;
+        ldpp_dout(this, 0) << "evaluating policy for stsTagSession returned deny/pass" << dendl;
         return -EPERM;
       }
     }
@@ -1157,7 +1145,7 @@ int RGWSTSAssumeRole::verify_permission(optional_yield y)
                                     op, *arn, boost::none, owner, p,
                                     s->iam_identity_policies,
                                     s->session_policies)) {
-      ldout(s->cct, 0) << "evaluating policy for op: " << op << " returned deny/pass" << dendl;
+      ldpp_dout(this, 0) << "evaluating policy for op: " << op << " returned deny/pass" << dendl;
       return -EPERM;
     }
   } catch (rgw::IAM::PolicyParseException& e) {

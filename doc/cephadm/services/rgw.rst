@@ -70,7 +70,7 @@ example spec file:
       label: rgw
       count_per_host: 2
     networks:
-    - 192.169.142.0/24
+    - 192.168.142.0/24
     spec:
       rgw_frontend_port: 8080
 
@@ -101,6 +101,58 @@ example spec file:
 .. note:: ``cephadm`` combines the arguments from the ``spec`` section with those from
 	  ``rgw_frontend_extra_args`` into a single space-separated arguments list
 	  which is used to set the value of the ``rgw_frontends`` configuration parameter.
+
+Adding a second port to accept HTTP traffic
+-------------------------------------------
+
+When SSL is enabled, the ``rgw_frontend_http_port`` parameter configures
+an additional port on the frontend that accepts plain HTTP traffic, while
+``rgw_frontend_port`` keeps serving HTTPS. The value is an integer, it must
+differ from ``rgw_frontend_port`` and it requires ``ssl: true``. Specs that set it
+without SSL are rejected by validation.
+
+Example spec file:
+
+.. code-block:: yaml
+
+    service_type: rgw
+    service_id: foo
+    placement:
+      label: rgw
+      count_per_host: 2
+    spec:
+      rgw_realm: myrealm
+      rgw_zone: myzone
+      rgw_frontend_type: "beast"
+      rgw_frontend_port: 443
+      rgw_frontend_http_port: 8080
+      ssl: true
+      generate_cert: true
+
+With ``count_per_host`` greater than one, each daemon on a host uses the
+next consecutive port for both ports, so the range starting at
+``rgw_frontend_port`` and the range starting at ``rgw_frontend_http_port``
+must not overlap. For the same reason ``port``, ``ssl_port``, ``endpoint``
+and ``ssl_endpoint`` cannot be set in ``rgw_frontend_extra_args`` when
+``rgw_frontend_http_port`` is used with ``count_per_host`` greater than
+one: every daemon on the host would bind the same fixed port.
+A port given in ``rgw_frontend_extra_args`` must also differ from
+``rgw_frontend_port``, from ``rgw_frontend_http_port`` and from the other
+ports in ``rgw_frontend_extra_args``.
+
+
+.. note::
+   ``cephadm`` combines the arguments from the ``spec`` section with those from
+   ``rgw_frontend_extra_args`` into a single space-separated argument list
+   which is used to set the value of the ``rgw_frontends`` configuration
+   parameter. Ports given in ``rgw_frontend_extra_args`` are passed on
+   unchanged and are independent of ``rgw_frontend_http_port``.
+
+.. note::
+   Adding ``rgw_frontend_http_port`` to an existing service redeploys
+   its RGW daemons so that the new port is opened.
+
+
 
 Multisite zones
 ---------------
@@ -343,6 +395,69 @@ new client requests during this time.
     or ``ceph orch daemon redeploy <daemon-name>`` commands
 
 
+Pushing bucket usage metrics to Pushgateway
+--------------------------------------------
+
+Cephadm can optionally push per-bucket and per-user RGW storage usage metrics
+to a Prometheus Pushgateway at a configurable interval.  A running pushgateway
+service is required (see :ref:`mgr-cephadm-monitoring`).
+
+To enable this, set ``metrics_push_enabled`` to ``true`` in the RGW service
+spec.  The following options are available:
+
+- ``metrics_push_enabled`` (bool, default ``false``) – enable the periodic
+  metrics push timer.
+- ``metrics_push_interval`` (int, default ``3600``, minimum ``60``) – how
+  often (in seconds) the push job runs.
+- ``metrics_push_timeout`` (int, default ``300``, minimum ``30``) – maximum
+  time (in seconds) the job can run before being killed.
+
+Example spec:
+
+.. code-block:: yaml
+
+    service_type: rgw
+    service_id: myrealm.myzone
+    placement:
+      hosts:
+      - host1
+    spec:
+      rgw_realm: myrealm
+      rgw_zone: myzone
+      metrics_push_enabled: true
+      metrics_push_interval: 3600
+      metrics_push_timeout: 300
+
+When enabled, cephadm installs a systemd timer for each RGW daemon that
+periodically runs the ``rgw-export-bucket-usage`` script inside the RGW
+container.  The following Prometheus metrics are pushed:
+
+- ``ceph_rgw_bucket_usage_bytes`` – total logical size in bytes per bucket
+- ``ceph_rgw_bucket_usage_bytes_utilized`` – total compressed size in bytes
+  per bucket
+- ``ceph_rgw_bucket_usage_objects`` – total number of objects per bucket
+
+Each metric carries ``bucket``, ``owner``, ``tenant``, and ``zone`` labels.
+
+When a service has multiple RGW daemons, only one daemon (the first
+sorted by name) is elected to run the metrics-push timer.  This avoids
+redundant bucket-stats scans across all daemons.  If the elected daemon
+becomes unavailable, the push pauses until cephadm recovers the daemon.
+To force a new election, remove the unhealthy daemon with
+``ceph orch daemon rm <daemon-name>``.
+
+.. note::
+
+   Enable ``metrics_push_enabled`` on only one RGW service per zone.
+   If multiple services share a zone and both enable it, each will
+   independently scan and push bucket stats for that zone.
+
+The timer is automatically cleaned up when the RGW daemon is removed or when
+``metrics_push_enabled`` is set to ``false``.  Changing ``metrics_push_interval``
+or ``metrics_push_timeout`` automatically reconfigures the timer.  When
+``secure_monitoring_stack`` is enabled, metrics are pushed over HTTPS with
+mTLS certificates that are provisioned automatically.
+
 Service specification
 ---------------------
 
@@ -363,7 +478,7 @@ balancing on a floating virtual IP.
 
 If the RGW service is configured with SSL enabled, then the ingress service
 will use the `ssl` and `verify none` options in the backend configuration.
-Trust verification is disabled because the backends are accessed by IP 
+Trust verification is disabled because the backends are accessed by IP
 address instead of FQDN.
 
 .. image:: ../../images/HAProxy_for_RGW.svg

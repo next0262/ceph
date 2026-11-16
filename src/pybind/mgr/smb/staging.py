@@ -6,6 +6,7 @@ from typing import (
     List,
     Optional,
     Set,
+    Tuple,
     Type,
     cast,
 )
@@ -17,13 +18,14 @@ import operator
 
 from ceph.fs.earmarking import EarmarkTopScope
 
-from . import config_store, resources, rgw, utils
+from . import config_store, external, resources, rgw, utils
 from .enums import (
     AuthMode,
     CaseInsensitiveCheckPolicy,
     ConfigNS,
     Intent,
     JoinSourceType,
+    PersistentHandlesDurability,
     SMBClustering,
     SourceReferenceType,
     State,
@@ -144,6 +146,156 @@ class Staging:
         return RGWCredentialEntry.from_store(
             self.destination_store, rgw_credential_id
         ).get_rgw_credential()
+
+    def check_availability_transitions(
+        self, public_store: ConfigStore
+    ) -> List[ErrorResult]:
+        """Validate transitions against the full batch after resource checks.
+        Return an error for every resource that is rejected.
+        """
+        affected: Dict[str, List[SMBResource]] = {}
+        for resource in self.incoming.values():
+            if isinstance(resource, (resources.Cluster, resources.Share)):
+                affected.setdefault(resource.cluster_id, []).append(resource)
+        errors: List[ErrorResult] = []
+        for cluster_id, batch in affected.items():
+            errors.extend(
+                self._check_cluster_availability(
+                    cluster_id, batch, public_store
+                )
+            )
+        return errors
+
+    def _check_cluster_availability(
+        self,
+        cluster_id: str,
+        batch: List[SMBResource],
+        public_store: ConfigStore,
+    ) -> List[ErrorResult]:
+        previous = self._previous_orchestrated_cluster(
+            cluster_id, public_store
+        )
+        if previous is None:
+            return []
+        cluster = self.get_cluster(cluster_id)
+        # Database backup behavior is fixed when smbd opens its databases.
+        durability = (
+            cluster.persistent_handles_durability
+            or PersistentHandlesDurability.FULL_OUTAGE
+        )
+        prev_durability = (
+            previous.persistent_handles_durability
+            or PersistentHandlesDurability.FULL_OUTAGE
+        )
+        if durability != prev_durability:
+            return [
+                ErrorResult(
+                    cluster,
+                    'persistent_handles_durability value may not be changed '
+                    'after orchestration has started or when its history is unknown',
+                    status={
+                        'existing_values': [
+                            {'persistent_handles_durability': prev_durability}
+                        ]
+                    },
+                )
+            ]
+        before, after = self._persistent_handles_transition(previous, cluster)
+        if before or not after:
+            return []
+        # Only the batch can introduce the requirement.
+        enablers = [
+            resource
+            for resource in batch
+            if (
+                isinstance(resource, resources.Cluster)
+                and resource.default_persistent_handles
+            )
+            or (
+                isinstance(resource, resources.Share)
+                and resource.persistent_handles_override
+            )
+        ]
+        return [
+            ErrorResult(
+                resource,
+                'persistent handles cannot be enabled after orchestration '
+                'has started or when its history is unknown',
+                status={
+                    'cluster_id': cluster_id,
+                    'hint': {
+                        'note': 'To enable persistent handles, remove and '
+                        'recreate the SMB cluster with them enabled before '
+                        'first orchestration. This interrupts SMB service.',
+                    },
+                },
+            )
+            for resource in enablers or batch[:1]
+        ]
+
+    def _previous_orchestrated_cluster(
+        self, cluster_id: str, public_store: ConfigStore
+    ) -> Optional[resources.Cluster]:
+        """Return the stored cluster if startup-sensitive checks apply."""
+        ckey = (str(ClusterEntry.namespace), cluster_id)
+        if ckey in self.deleted or ckey not in self._store_keys():
+            return None
+        if not external.cluster_orchestration_submitted(
+            public_store, cluster_id
+        ):
+            return None
+        return ClusterEntry.from_store(
+            self.destination_store, cluster_id
+        ).get_cluster()
+
+    def _persistent_handles_transition(
+        self, previous: resources.Cluster, cluster: resources.Cluster
+    ) -> Tuple[bool, bool]:
+        """Return global support requirements before and after the full batch."""
+        shares = ShareEntry.get_cluster_shares(
+            self.destination_store, cluster.cluster_id
+        )
+        before = resources.requires_persistent_handles(
+            previous, shares.values()
+        )
+        for key in self.deleted:
+            shares.pop(key, None)
+        for key, resource in self.incoming.items():
+            if (
+                isinstance(resource, resources.Share)
+                and resource.cluster_id == cluster.cluster_id
+            ):
+                shares[key] = resource
+        after = resources.requires_persistent_handles(
+            cluster, shares.values()
+        )
+        return before, after
+
+    def warn_availability_transitions(
+        self, public_store: ConfigStore, results: ResultGroup
+    ) -> None:
+        """Warn once per cluster when disabling support becomes irreversible."""
+        affected: Dict[str, ResourceResult] = {}
+        for result in results.resources():
+            if isinstance(
+                result.src,
+                (resources.Cluster, resources.Share, resources.RemovedShare),
+            ):
+                affected.setdefault(result.src.cluster_id, result)
+        for cluster_id, recorder in affected.items():
+            previous = self._previous_orchestrated_cluster(
+                cluster_id, public_store
+            )
+            if previous is None:
+                continue
+            before, after = self._persistent_handles_transition(
+                previous, self.get_cluster(cluster_id)
+            )
+            if before and not after:
+                recorder.record_warning(
+                    f'Persistent handles disabled for cluster "{cluster_id}"; '
+                    'cannot be re-enabled.'
+                )
 
     def save(self) -> ResultGroup:
         results = ResultGroup()
@@ -456,6 +608,24 @@ def _check_cluster_modifications(
             'value': opt_terms[prev_clustering],
         }
         raise ErrorResult(cluster, msg, status={'hint': hint})
+    acl_support = prev_acl_support = None
+    if cluster.share_defaults and cluster.share_defaults.acl_support:
+        acl_support = cluster.share_defaults.acl_support
+    if prev.share_defaults and prev.share_defaults.acl_support:
+        prev_acl_support = prev.share_defaults.acl_support
+    if acl_support != prev_acl_support:
+        # Toggling acl support can really mess up perms on your system. Block
+        # changing this setting. If you know what you are doing you can point
+        # two shares at the same place instead.
+        existing_values = [{'acl_support': prev_acl_support}]
+        raise ErrorResult(
+            cluster,
+            (
+                'the cluster\'s share_defaults'
+                ' acl_support value may not be changed'
+            ),
+            status={'existing_values': existing_values},
+        )
 
 
 def _check_cluster_keybridge(cluster: resources.Cluster) -> None:
@@ -497,6 +667,8 @@ def _check_share_resource(
             status={"cluster_id": share.cluster_id},
         )
 
+    if not staging.is_new(share):
+        _check_share_modifications(share, staging)
     # Handle RGW shares
     if share.rgw is not None:
         _check_share_rgw(share, staging)
@@ -508,11 +680,47 @@ def _check_share_resource(
     raise ValueError(f"invalid share: missing rgw and cephfs config: {share}")
 
 
+def warn_availability(
+    resource: SMBResource,
+    staging: Staging,
+    recorder: WarningRecorder,
+) -> None:
+    """Warn about enabled handles once the whole batch passes checks."""
+    if isinstance(resource, resources.Cluster):
+        if not resource.default_persistent_handles:
+            return
+        message = (
+            'Persistent handles are enabled by default for CephFS shares in '
+            f'cluster "{resource.cluster_id}"; shares can opt out with '
+            'availability.persistent_handles: false.'
+        )
+    elif isinstance(resource, resources.Share):
+        cluster = staging.get_cluster(resource.cluster_id)
+        if not resource.persistent_handles_enabled(cluster):
+            return
+        name = f'{resource.cluster_id}.{resource.share_id}'
+        if resource.persistent_handles_override:
+            message = (
+                f'Persistent handles are enabled for CephFS share "{name}".'
+            )
+        else:
+            message = (
+                f'CephFS share "{name}" inherits persistent handles from '
+                f'cluster "{cluster.cluster_id}".'
+            )
+    else:
+        return  # not a cluster or share
+    recorder.record_warning(
+        f'{message} Persistent-handle state management can significantly '
+        'impact performance.'
+    )
+
+
 def _check_share_rgw(share: resources.Share, staging: Staging) -> None:
     assert share.rgw  # appease mypy
     # Check if cluster uses external Ceph cluster
     cluster = staging.get_cluster(share.cluster_id)
-    is_external_cluster = (
+    is_external_cluster = bool(
         cluster.external_ceph_cluster is not None
         and cluster.external_ceph_cluster.ref
     )
@@ -589,6 +797,28 @@ def _check_share_rgw(share: resources.Share, staging: Staging) -> None:
                     'other_cluster_id': cred.linked_to_cluster,
                 },
             )
+
+        # Always validate credentials against RGW when a share is staged,
+        # even if the credential resource itself is not being updated in this
+        # transaction. This ensures a stale or invalid pre-existing credential
+        # cannot be used to create a new share.
+        if not is_external_cluster:
+            try:
+                rgw.validate_rgw_credentials(
+                    staging._tool_execer,
+                    cred.user_id,
+                    cred.access_key_id,
+                    cred.secret_access_key,
+                )
+            except ValueError as e:
+                raise ErrorResult(
+                    share,
+                    msg=f"RGW credentials in '{share.rgw.credential_ref}' are not usable: {e}",
+                    status={
+                        "credential_ref": share.rgw.credential_ref,
+                    },
+                )
+
     # Validate bucket exists (skip for external clusters)
     if not is_external_cluster:
         if not rgw.validate_rgw_bucket(
@@ -798,6 +1028,32 @@ def _check_case_sensitivity_settings(
     )
 
 
+def _check_share_modifications(
+    share: resources.Share, staging: Staging
+) -> None:
+    """share has some fields we do not permit changing after it has
+    been created.
+    """
+    prev = ShareEntry.from_store(
+        staging.destination_store, share.cluster_id, share.share_id
+    ).get_share()
+    acl_support = prev_acl_support = None
+    if share.acl_support:
+        acl_support = share.acl_support
+    if prev.acl_support:
+        prev_acl_support = prev.acl_support
+    if acl_support != prev_acl_support:
+        # Toggling acl support can really mess up perms on your system. Block
+        # changing this setting. If you know what you are doing you can point
+        # two shares at the same place instead.
+        existing_values = [{'acl_support': prev_acl_support}]
+        raise ErrorResult(
+            share,
+            'the share\'s acl_support value may not be changed',
+            status={'existing_values': existing_values},
+        )
+
+
 @cross_check_resource.register
 def _check_join_auth_resource(
     join_auth: resources.JoinAuth, staging: Staging, **_: Any
@@ -972,6 +1228,15 @@ def _check_rgw_credential_removed(
         )
 
 
+def _is_external_cluster(cluster_id: str, staging: Staging) -> bool:
+    """Return True if the cluster uses an external Ceph cluster."""
+    cluster = staging.get_cluster(cluster_id)
+    return bool(
+        cluster.external_ceph_cluster is not None
+        and cluster.external_ceph_cluster.ref
+    )
+
+
 def _check_rgw_credential_present(
     rgw_cred: resources.RGWCredential, staging: Staging
 ) -> None:
@@ -985,6 +1250,60 @@ def _check_rgw_credential_present(
                     'unknown_id': rgw_cred.linked_to_cluster,
                 },
             )
+
+        # Validate credentials against RGW (skip for external clusters)
+        if not _is_external_cluster(rgw_cred.linked_to_cluster, staging):
+            try:
+                rgw.validate_rgw_credentials(
+                    staging._tool_execer,
+                    rgw_cred.user_id,
+                    rgw_cred.access_key_id,
+                    rgw_cred.secret_access_key,
+                )
+            except ValueError as e:
+                raise ErrorResult(
+                    rgw_cred,
+                    msg=f"RGW credentials in '{rgw_cred.rgw_credential_id}' are not usable: {e}",
+                )
+    else:
+        # No linked_to_cluster: check if any staged share references this credential
+        # on a local (non-external) cluster, and validate in that case.
+        # Credentials used only with external clusters must not be validated against
+        # the local RGW, as radosgw-admin has no visibility into the remote cluster.
+        for cid, sid in ShareEntry.ids(staging):
+            ekey = (str(ShareEntry.namespace), f'{cid}.{sid}')
+            incoming = staging.incoming.get(ekey)
+            if incoming is not None:
+                if not isinstance(incoming, resources.Share):
+                    continue
+                share = incoming
+            else:
+                try:
+                    share = ShareEntry.from_store(
+                        staging.destination_store, cid, sid
+                    ).get_share()
+                except KeyError:
+                    continue
+            if (
+                share.rgw
+                and share.rgw.credential_ref == rgw_cred.rgw_credential_id
+                and not _is_external_cluster(share.cluster_id, staging)
+            ):
+                # At least one local-cluster share uses this credential — validate it.
+                try:
+                    rgw.validate_rgw_credentials(
+                        staging._tool_execer,
+                        rgw_cred.user_id,
+                        rgw_cred.access_key_id,
+                        rgw_cred.secret_access_key,
+                    )
+                except ValueError as e:
+                    raise ErrorResult(
+                        rgw_cred,
+                        msg=f"RGW credentials in '{share.rgw.credential_ref}' are not usable: {e}",
+                    )
+                # Validated successfully; no need to check remaining shares.
+                return
 
 
 @cross_check_resource.register

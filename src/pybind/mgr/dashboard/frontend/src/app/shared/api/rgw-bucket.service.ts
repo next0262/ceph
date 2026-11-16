@@ -1,15 +1,14 @@
 import { HttpClient, HttpParams } from '@angular/common/http';
 import { Injectable } from '@angular/core';
 
-import _ from 'lodash';
 import { BehaviorSubject, Observable, of as observableOf, throwError } from 'rxjs';
-import { catchError, distinctUntilChanged, map, mapTo, shareReplay, tap } from 'rxjs/operators';
+import { catchError, distinctUntilChanged, map, shareReplay, tap } from 'rxjs/operators';
 import { Bucket } from '~/app/ceph/rgw/models/rgw-bucket';
 import { RgwRateLimitConfig } from '~/app/ceph/rgw/models/rgw-rate-limit';
 
 import { ApiClient } from '~/app/shared/api/api-client';
 import { RgwDaemonService } from '~/app/shared/api/rgw-daemon.service';
-import { cdEncode } from '~/app/shared/decorators/cd-encode';
+import { cdEncode, cdEncodeNot } from '~/app/shared/decorators/cd-encode';
 import { KmipConfig, VaultConfig } from '../models/rgw-encryption-config-keys';
 
 @cdEncode
@@ -48,7 +47,10 @@ export class RgwBucketService extends ApiClient {
     this.bucketRateLimitCache.clear();
   }
 
-  private invalidateBucketCache(bucket: string) {
+  // The callers already pass the URI-encoded bucket id (see @cdEncode), which is how
+  // the caches are keyed. Encoding it again would never match a tenanted bucket id
+  // such as 'tenant%2Fbucket' and leave stale entries behind.
+  private invalidateBucketCache(@cdEncodeNot bucket: string) {
     this.bucketDetailsCache.delete(bucket);
     this.bucketRateLimitCache.delete(bucket);
   }
@@ -103,15 +105,17 @@ export class RgwBucketService extends ApiClient {
 
   /**
    * Get the list of buckets.
-   * @return Observable<Object[]>
+   * Without stats: bucket names. With stats: full bucket objects.
    */
-  list(stats: boolean = false, uid: string = '') {
+  list(stats?: false, uid?: string): Observable<string[]>;
+  list(stats: true, uid?: string): Observable<Bucket[]>;
+  list(stats: boolean = false, uid: string = ''): Observable<string[] | Bucket[]> {
     return this.rgwDaemonService.request((params: HttpParams) => {
       params = params.append('stats', stats.toString());
       if (uid) {
         params = params.append('uid', uid);
       }
-      return this.http.get(this.url, {
+      return this.http.get<string[] | Bucket[]>(this.url, {
         headers: { Accept: this.getVersionHeaderValue(1, 1) },
         params: params
       });
@@ -253,19 +257,26 @@ export class RgwBucketService extends ApiClient {
 
   /**
    * Check if the specified bucket exists.
+   * Uses a direct GET (not the details cache) so a 404 used only for
+   * existence checks can reliably call preventDefault and avoid toasts.
    * @param {string} bucket The bucket name to check.
    * @return Observable<boolean>
    */
   exists(bucket: string) {
-    return this.get(bucket).pipe(
-      mapTo(true),
-      catchError((error: Event) => {
-        if (_.isFunction(error.preventDefault)) {
-          error.preventDefault();
-        }
-        return observableOf(false);
+    return this.rgwDaemonService
+      .request((params: HttpParams) => {
+        return this.http.get(`${this.url}/${bucket}`, { params: params });
       })
-    );
+      .pipe(
+        map(() => true),
+        catchError((error: any) => {
+          if (error?.status === 404) {
+            error?.preventDefault?.();
+            return observableOf(false);
+          }
+          throw error;
+        })
+      );
   }
 
   getLockDays(bucketData: object): number {
@@ -304,7 +315,9 @@ export class RgwBucketService extends ApiClient {
   }
 
   setLifecycle(bucket_name: string, lifecycle: string, owner: string, tenant: string) {
-    const bid = tenant ? `${tenant}/${bucket_name}` : bucket_name;
+    // tenant and bucket_name are already encoded by @cdEncode, so only the separator
+    // needs encoding to build the same key that get() uses.
+    const bid = tenant ? `${tenant}${encodeURIComponent('/')}${bucket_name}` : bucket_name;
     return this.rgwDaemonService
       .request((params: HttpParams) => {
         params = params.appendAll({

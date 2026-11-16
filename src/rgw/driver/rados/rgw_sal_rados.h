@@ -352,7 +352,7 @@ class RadosStore : public StoreDriver {
     virtual int register_to_service_map(const DoutPrefixProvider *dpp, const std::string& daemon_type,
 				const std::map<std::string, std::string>& meta) override;
     virtual void get_quota(RGWQuota& quota) override;
-    virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit) override;
+    virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& account_ratelimit, RGWRateLimitInfo& anon_ratelimit) override;
     virtual int set_buckets_enabled(const DoutPrefixProvider* dpp, std::vector<rgw_bucket>& buckets, bool enabled, optional_yield y) override;
     virtual int get_sync_policy_handler(const DoutPrefixProvider* dpp,
 					std::optional<rgw_zone_id> zone,
@@ -588,6 +588,7 @@ class RadosObject : public StoreObject {
                const ceph::real_time* mod_ptr, const ceph::real_time* unmod_ptr,
                bool high_precision_time,
                const char* if_match, const char* if_nomatch,
+               const char* dest_if_match, const char* dest_if_nomatch,
                AttrsMod attrs_mod, bool copy_if_newer, Attrs& attrs,
                RGWObjCategory category, uint64_t olh_epoch,
 	       boost::optional<ceph::real_time> delete_at,
@@ -836,7 +837,7 @@ class RadosBucket : public StoreBucket {
 class RadosVectorBucket : public RadosBucket {
   public:
     using RadosBucket::RadosBucket; // inherit RadosBucket's constructors
-    ~RadosVectorBucket() override = default;
+    ~RadosVectorBucket() override;
 
     int remove(const DoutPrefixProvider* dpp, bool delete_children, optional_yield y) override;
     int create(const DoutPrefixProvider* dpp, const CreateParams& params,
@@ -1313,6 +1314,7 @@ class RadosLuaManager : public StoreLuaManager {
   uint64_t watch_handle = 0;
   std::map<std::string, uint64_t> script_watches;
   std::map<uint64_t, std::string> reverse_script_watches;
+  std::shared_mutex watch_mutex;
 
 public:
   RadosLuaManager(RadosStore* _s, const std::string& _luarocks_path);

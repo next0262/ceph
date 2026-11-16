@@ -443,7 +443,8 @@ class RGWRados
   int get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx,
                          RGWBucketInfo& bucket_info, const rgw_obj& obj,
                          RGWObjStateManifest** psm, bool follow_olh,
-                         optional_yield y, bool assume_noent = false);
+                         optional_yield y, bool assume_noent = false,
+                         const rgw_placement_rule *placement_rule = nullptr);
   int append_atomic_test(const DoutPrefixProvider *dpp, RGWObjectCtx* rctx, RGWBucketInfo& bucket_info, const rgw_obj& obj,
                          librados::ObjectOperation& op, RGWObjState **state,
 			 RGWObjManifest** pmanifest, optional_yield y);
@@ -1239,6 +1240,8 @@ public:
                        bool high_precision_time,
                        const char *if_match,
                        const char *if_nomatch,
+                       const char *dest_if_match,
+                       const char *dest_if_nomatch,
                        AttrsMod attrs_mod,
                        bool copy_if_newer,
                        rgw::sal::Attrs& attrs,
@@ -1289,6 +1292,8 @@ public:
                bool high_precision_time,
                const char *if_match,
                const char *if_nomatch,
+               const char *dest_if_match,
+               const char *dest_if_nomatch,
                AttrsMod attrs_mod,
                bool copy_if_newer,
                std::map<std::string, bufferlist>& attrs,
@@ -1317,11 +1322,14 @@ public:
                uint64_t olh_epoch,
 	       ceph::real_time delete_at,
                std::string *petag,
+               const char *dest_if_match,
+               const char *dest_if_nomatch,
                rgw::sal::DataProcessorFactory *dp_factory,
                const DoutPrefixProvider *dpp,
                optional_yield y,
                uint64_t src_accounted_size = 0,
-               bool log_op = true);
+               bool log_op = true,
+               bool *pcanceled = nullptr);
 
   int transition_obj(RGWObjectCtx& obj_ctx,
                      RGWBucketInfo& bucket_info,
@@ -1401,13 +1409,13 @@ int restore_obj_from_cloud(RGWLCCloudTierCtx& tier_ctx,
                         std::map<std::string, bufferlist>& attrs,
                         std::map<std::string, bufferlist>* rmattrs,
                         optional_yield y,
-                        bool log_op,
-                        ceph::real_time set_mtime = ceph::real_clock::zero());
+                        bool log_op);
 
   int get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx,
                     RGWBucketInfo& bucket_info, const rgw_obj& obj,
                     RGWObjStateManifest** psm, bool follow_olh,
-                    optional_yield y, bool assume_noent = false);
+                    optional_yield y, bool assume_noent = false,
+                    const rgw_placement_rule *placement_rule = nullptr);
 
   int get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx,
                     RGWBucketInfo& bucket_info, const rgw_obj& obj,
